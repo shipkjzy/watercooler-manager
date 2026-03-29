@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+
+# Build
+build/
+dist/
+*.spec.bak
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Runtime files
+watercooler.json
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

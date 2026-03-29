@@ -1,153 +1,136 @@
+# Watercooler Manager Enhanced
 
-# Watercooler Manager GUI
+一个用于 Windows 的水冷控制器图形化管理工具，可通过 BLE 连接兼容设备，并结合 CPU / GPU 温度实现风扇、水泵和 RGB 的手动或自动控制。
 
-> **Based on** [tomups/watercooler-manager](https://github.com/tomups/watercooler-manager)  
-> **Uses** [LibreHardwareMonitor/LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) for real-time CPU and GPU temperature monitoring.
+## 项目来源
 
-## Overview
-![Picture1](https://i.imgur.com/EuxEdPa.png)
-![Picture2](https://i.imgur.com/eKr77QT.png)
+本项目基于上游开源项目继续二次开发：
 
-**Watercooler Manager GUI** is a standalone desktop application for Windows, designed for advanced control and monitoring of custom watercooling systems over BLE (Bluetooth Low Energy).  
-It allows you to manage fan, pump, and RGB lighting settings, and provides both manual and automatic (curve-based) control modes.  
-Real-time CPU/GPU temperature monitoring is implemented via LibreHardwareMonitor, ensuring safe and optimal system operation.
+- `noteMASTER11/watercooler-manager`
+- `tomups/watercooler-manager`
 
----
+温度监控依赖：
 
-## Features
+- `LibreHardwareMonitor`
 
-- **BLE communication** with compatible watercooling controllers (e.g., LCT21001, LCT22002).
-- **Manual mode:** direct sliders to set fan speed, pump voltage, and RGB lighting.
-- **Curve mode:** fully editable fan curve (drag points on the graph; temperature vs fan %).
-- **Real-time temperature display:** always visible current CPU and GPU temperatures (°C).
-- **Customizable polling rate** for temperature updates (0.5s to 10s).
-- **Automatic fan control** in curve mode, with smooth adjustment based on CPU temperature.
-- **System tray integration** for running in the background with Show/Exit options.
-- **Robust error handling:** last known temperature is displayed if sensor polling fails.
-- **Asynchronous UI** (no freezes; responsive at all times).
+## 当前版本新增/改进
 
----
+- 中文界面与本地化调整
+- 手动 / 自动双模式控制
+- 风扇自动曲线支持多坐标点
+- 水泵自动曲线支持多坐标点
+- 风扇速度以百分比显示与调节
+- 水泵最大电压限制为 11V
+- RGB 灯效控制
+- 温控 RGB 联动
+- 深色 / 浅色 / 跟随系统主题
+- 配置文件持久化
+- 启动自动申请管理员权限
+- 自动模式防抖
+  - 温度回差
+  - 中值采样过滤
+  - 风扇最短启停间隔
+  - 水泵最短启停间隔
+- 首次启动默认参数优化
+- 托盘与窗口行为优化
 
-## Credits
+## 主要功能
 
-- **BLE protocol reverse engineering and original CLI utility:**  
-  [tomups/watercooler-manager](https://github.com/tomups/watercooler-manager)  
-  Without this project, BLE packet structure and controller support would not be possible.
+- 通过 BLE 连接兼容的水冷控制器
+- 手动设置风扇、水泵、RGB
+- 根据温度自动调节风扇和水泵
+- 根据温度区间自动切换 RGB 颜色
+- 支持风扇/水泵自动曲线编辑
+- 支持深色、浅色、跟随系统主题
+- 支持配置自动保存和加载
 
-- **Hardware temperature monitoring:**  
-  [LibreHardwareMonitor/LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)  
-  Used via `pythonnet` to access Windows sensors in real time.
+## 运行环境
 
----
+- Windows 10 / 11
+- Python 3.8+
+- 蓝牙适配器可用
+- 建议以管理员权限运行
 
-## Supported Hardware
+## 安装依赖
 
-- Watercooling controllers with BLE protocol compatible with [tomups/watercooler-manager](https://github.com/tomups/watercooler-manager) (LCT21001, LCT22002, etc).
-- Windows PC with supported CPU and GPU (Intel/AMD CPU, Nvidia/AMD GPU).
+```bash
+pip install -r requirements.txt
+```
 
----
-
-## Requirements
-
-- Windows 10/11 (Python and LibreHardwareMonitor require Windows; BLE usually requires BT 4.0+).
-- Python 3.8 or newer (recommended: 3.9 or 3.10 for maximum compatibility).
-
-### Python Dependencies
+常见依赖包括：
 
 - `PyQt5`
 - `qasync`
 - `bleak`
 - `pythonnet`
-- (Your actual requirements may also include: `setuptools`, `wheel`, `pyinstaller`, etc.)
 
-Install all with:
+## 额外文件
 
-```sh
-pip install -r requirements.txt
-```
+请确保以下文件与程序一同提供：
 
-**Sample `requirements.txt`:**
+- `LibreHardwareMonitorLib.dll`
+- `icons/` 目录
 
-```
-PyQt5>=5.15
-qasync>=0.24
-bleak>=0.18
-pythonnet>=3.0
-```
+## 运行
 
----
-
-### Additional Files Needed
-
-- Place **`LibreHardwareMonitorLib.dll`** (from [LibreHardwareMonitor releases](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases)) in the **same directory** as the Python script or executable.
-- Place icon files (`icons/water_drop.ico` and/or `icons/water_drop.png`) in an `icons` subfolder next to the script for system tray support (optional but recommended).
-
----
-
-## Usage
-
-```sh
+```bash
 python watercooler_bt_gui.py
 ```
 
-The application window will appear.  
-If compatible BLE devices are nearby, the program will scan for them automatically.  
-Connect, adjust settings, and monitor your system in real time!
+## 打包
 
----
-
-## Building a Standalone Windows EXE
-
-You can build a single-file Windows executable using [PyInstaller](https://pyinstaller.org/):
-
-### 1. Install PyInstaller
-
-```sh
-pip install pyinstaller
+### 直接使用 spec
+```bash
+pyinstaller watercooler_bt_gui.spec
 ```
 
-### 2. Build the Executable
-
-From the directory containing your script, run:
-
-```sh
+### 或手动命令
+```bash
 pyinstaller --onefile --add-data "LibreHardwareMonitorLib.dll;." --add-data "icons;icons" --noconsole watercooler_bt_gui.py
 ```
 
-- The `--onefile` flag bundles everything into a single `.exe`.
-- `--add-data` ensures `LibreHardwareMonitorLib.dll` and icons are included.  
-  (On Windows, use `;` as a separator. On Linux/Mac, use `:`.)
-- `--noconsole` disables the command prompt window.
+## 配置文件
 
-The built `.exe` will appear in the `dist` folder.  
-Copy any needed BLE drivers and run!
+程序会在运行目录生成并读取配置文件：
 
----
+- `watercooler.json`
 
-## Known Issues & Troubleshooting
+配置文件用于保存：
 
-- **Sensor errors / NullReferenceException:** If temperature readings fail, the app will display the last known value and retry next cycle.
-- **BLE connection issues:** Ensure your device is powered, close other BLE tools, and try reconnecting. Some USB BT dongles may need a driver update.
-- **LibreHardwareMonitorLib.dll not found:** Ensure the DLL is in the same folder as the EXE/script.
+- 控制模式
+- 风扇参数
+- 水泵参数
+- RGB 参数
+- 自动曲线
+- 主题设置
+- 更新频率
+- 自动模式防抖参数
 
----
+## 上传到 GitHub 前建议
 
-## Development Notes
+- 仓库根目录保留 `LICENSE`
+- 仓库根目录保留 `THIRD_PARTY_NOTICES.md`
+- 发布二进制时，同时公开对应源码版本
+- Release 里说明本版本相对上游的修改点
+- 不要把上游 README 里的 MIT 表述原样带入你自己的仓库说明
 
-- Code is fully asynchronous: no blocking UI even during hardware polling.
-- To add support for new controllers, edit the BLE scan models and/or command structure in the Python source.
-- The fan curve widget supports arbitrary points and drag-and-drop.
-- All UI strings are isolated for easy localization.
+## 第三方组件与致谢
 
----
+感谢以下项目提供基础能力或参考：
+
+- `tomups/watercooler-manager`
+- `noteMASTER11/watercooler-manager`
+- `LibreHardwareMonitor`
+
+详细说明见：
+
+- `THIRD_PARTY_NOTICES.md`
 
 ## License
 
-The code here is released under the **MIT License**, but please see the original licenses for  
-- [tomups/watercooler-manager](https://github.com/tomups/watercooler-manager)  
-- [LibreHardwareMonitor/LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)  
-as they may place additional requirements on redistribution.
+当前建议按 **GPL-3.0** 方式公开发布本项目，并同时保留第三方说明文件。
 
----
+详细说明见：
 
-**Enjoy your custom-cooled PC!**
+- `LICENSE`
+- `THIRD_PARTY_NOTICES.md`

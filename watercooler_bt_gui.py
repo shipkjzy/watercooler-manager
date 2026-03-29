@@ -31,6 +31,8 @@ import platform
 import ctypes
 import subprocess
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # === UI STRINGS ===
 UI = {
@@ -70,6 +72,10 @@ DEFAULT_AUTO_DEBOUNCE_SAMPLES = 3
 DEFAULT_AUTO_HYSTERESIS_C = 2.0
 DEFAULT_AUTO_FAN_MIN_TOGGLE_INTERVAL_SEC = 3.0
 DEFAULT_AUTO_PUMP_MIN_TOGGLE_INTERVAL_SEC = 3.0
+DEFAULT_EXPORT_API_HOST = '127.0.0.1'
+DEFAULT_EXPORT_API_PORT = 21977
+MIN_CURVE_POINTS = 2
+MAX_CURVE_POINTS = 8
 
 LEGACY_FAN_CURVE_DEFAULTS = [
     [(40, 0), (50, 50), (60, MAX_SAFE_FAN_PERCENT)],
@@ -105,6 +111,11 @@ def clamp_curve_percent(percent: int) -> int:
     return max(0, min(percent, MAX_SAFE_FAN_PERCENT))
 
 
+def clamp_pump_curve_value(value: int) -> int:
+    value = int(value)
+    return min(PUMP_CURVE_LEVELS, key=lambda candidate: abs(candidate - value))
+
+
 def fan_percent_to_duty(percent: int) -> int:
     return clamp_fan_duty(round(clamp_curve_percent(percent) / 100.0 * 255))
 
@@ -133,10 +144,7 @@ def normalize_fan_curve_points(points):
 
 
 def normalize_pump_curve_points(points):
-    def _normalize(value):
-        value = int(value)
-        return min(PUMP_CURVE_LEVELS, key=lambda candidate: abs(candidate - value))
-    return _normalize_curve_points(points, _normalize, DEFAULT_PUMP_CURVE_POINTS)
+    return _normalize_curve_points(points, clamp_pump_curve_value, DEFAULT_PUMP_CURVE_POINTS)
 
 
 def pump_curve_value_to_text(value):
@@ -223,6 +231,89 @@ def ensure_admin_rights() -> bool:
         return False
 
 
+
+class ExportApiState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._snapshot = {
+            'ok': True,
+            'app': 'watercooler-manager',
+            'connected': False,
+            'mode': 'manual',
+            'fan': {'percent': 0, 'text': '0%', 'is_off': True},
+            'pump': {'voltage': 0, 'text': '关闭', 'is_off': True},
+            'temperature': {'cpu_c': None, 'gpu_c': None, 'control_c': None},
+            'device_name': None,
+            'timestamp': int(time.time()),
+        }
+
+    def update(self, **fields):
+        with self._lock:
+            self._snapshot.update(fields)
+            self._snapshot['timestamp'] = int(time.time())
+
+    def snapshot(self):
+        with self._lock:
+            return json.loads(json.dumps(self._snapshot, ensure_ascii=False))
+
+
+class WatercoolerApiServer:
+    def __init__(self, state: ExportApiState, host: str = DEFAULT_EXPORT_API_HOST, port: int = DEFAULT_EXPORT_API_PORT):
+        self.state = state
+        self.host = host
+        self.port = int(port)
+        self._server = None
+        self._thread = None
+
+    def start(self):
+        if self._server is not None:
+            return
+
+        state = self.state
+
+        class _Handler(BaseHTTPRequestHandler):
+            def _send_json(self, payload, status=200):
+                body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+                self.send_response(status)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path in ('/', '/api', '/api/status'):
+                    self._send_json(state.snapshot())
+                elif self.path == '/api/health':
+                    self._send_json({'ok': True, 'timestamp': int(time.time())})
+                else:
+                    self._send_json({'ok': False, 'error': 'not_found'}, status=404)
+
+            def log_message(self, format, *args):
+                return
+
+        try:
+            self._server = ThreadingHTTPServer((self.host, self.port), _Handler)
+        except OSError as exc:
+            print(f'Export API start failed on {self.host}:{self.port}: {exc}')
+            self._server = None
+            return
+
+        self._thread = threading.Thread(target=self._server.serve_forever, name='WatercoolerExportApi', daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if self._server is None:
+            return
+        try:
+            self._server.shutdown()
+            self._server.server_close()
+        except Exception:
+            pass
+        self._server = None
+        self._thread = None
+
+
 class Settings:
     REGISTRY_KEY = r"Software\WaterCooler"
     CONFIG_FILE = str(get_app_dir() / "watercooler.json")
@@ -254,17 +345,16 @@ class Settings:
         self.auto_debounce_samples = DEFAULT_AUTO_DEBOUNCE_SAMPLES
         self.auto_fan_min_toggle_interval_sec = DEFAULT_AUTO_FAN_MIN_TOGGLE_INTERVAL_SEC
         self.auto_pump_min_toggle_interval_sec = DEFAULT_AUTO_PUMP_MIN_TOGGLE_INTERVAL_SEC
+        self.export_api_enabled = False
+        self.export_api_port = DEFAULT_EXPORT_API_PORT
         self.load()
         self.normalize()
 
     def load(self):
-        loaded = self._load_from_file()
-        if loaded:
-            return
-        if platform.system() == 'Windows':
-            if self._load_from_registry():
-                self.normalize()
-                self._save_to_file()
+        # 仅从运行目录配置文件加载。若文件不存在，则使用代码内默认值。
+        # 不再从 Windows 注册表回退读取旧配置，避免删除 watercooler.json 后
+        # 又把历史曲线（例如 3 点曲线）恢复回来。
+        self._load_from_file()
 
     def save(self):
         self.normalize()
@@ -358,6 +448,13 @@ class Settings:
             legacy_interval = getattr(self, 'auto_min_toggle_interval_sec', DEFAULT_AUTO_PUMP_MIN_TOGGLE_INTERVAL_SEC)
             self.auto_pump_min_toggle_interval_sec = legacy_interval
         self.auto_pump_min_toggle_interval_sec = max(0.0, min(float(self.auto_pump_min_toggle_interval_sec), 30.0))
+
+        self.export_api_enabled = bool(getattr(self, 'export_api_enabled', False))
+        try:
+            self.export_api_port = int(getattr(self, 'export_api_port', DEFAULT_EXPORT_API_PORT))
+        except Exception:
+            self.export_api_port = DEFAULT_EXPORT_API_PORT
+        self.export_api_port = max(1024, min(int(self.export_api_port), 65535))
 
     def _load_from_registry(self):
         try:
@@ -454,6 +551,8 @@ class Settings:
                 legacy_min_toggle = config.get('auto_min_toggle_interval_sec', DEFAULT_AUTO_FAN_MIN_TOGGLE_INTERVAL_SEC)
                 self.auto_fan_min_toggle_interval_sec = config.get('auto_fan_min_toggle_interval_sec', legacy_min_toggle)
                 self.auto_pump_min_toggle_interval_sec = config.get('auto_pump_min_toggle_interval_sec', legacy_min_toggle)
+                self.export_api_enabled = config.get('export_api_enabled', False)
+                self.export_api_port = config.get('export_api_port', DEFAULT_EXPORT_API_PORT)
             return True
         except Exception:
             return False
@@ -486,7 +585,9 @@ class Settings:
                 'auto_hysteresis_c': self.auto_hysteresis_c,
                 'auto_debounce_samples': self.auto_debounce_samples,
                 'auto_fan_min_toggle_interval_sec': self.auto_fan_min_toggle_interval_sec,
-                'auto_pump_min_toggle_interval_sec': self.auto_pump_min_toggle_interval_sec
+                'auto_pump_min_toggle_interval_sec': self.auto_pump_min_toggle_interval_sec,
+                'export_api_enabled': self.export_api_enabled,
+                'export_api_port': self.export_api_port
             }
             config_path = Path(self.CONFIG_FILE)
             config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -684,6 +785,9 @@ class FanCurveWidget(QtWidgets.QWidget):
         super().__init__()
         self.points = sorted(points)
         self.selected = None
+        self.dragging = False
+        self.selection_changed_callback = None
+        self.points_changed_callback = None
         self._left = 58
         self._top = 18
         self._right = 26
@@ -691,6 +795,14 @@ class FanCurveWidget(QtWidgets.QWidget):
         self._colors = dict(self.DARK_COLORS)
         self.setMinimumHeight(280)
         self.setMouseTracking(True)
+
+    def _notify_selection_changed(self):
+        if callable(self.selection_changed_callback):
+            self.selection_changed_callback()
+
+    def _notify_points_changed(self):
+        if callable(self.points_changed_callback):
+            self.points_changed_callback()
 
     def set_theme_mode(self, theme_mode):
         self._colors = dict(self.DARK_COLORS if theme_mode == 'dark' else self.LIGHT_COLORS)
@@ -775,15 +887,22 @@ class FanCurveWidget(QtWidgets.QWidget):
 
     def mousePressEvent(self, event):
         x, y = event.x(), event.y()
+        self.dragging = False
         for i, (t, p) in enumerate(self.points):
             pos = self._point_to_pos(t, p)
             if abs(pos.x() - x) <= 8 and abs(pos.y() - y) <= 8:
                 self.selected = i
+                self.dragging = True
                 self.update()
+                self._notify_selection_changed()
                 return
+        if self.selected is not None:
+            self.selected = None
+            self.update()
+            self._notify_selection_changed()
 
     def mouseMoveEvent(self, event):
-        if self.selected is None:
+        if self.selected is None or not self.dragging:
             return
         t, p = self._pos_to_point(event.x(), event.y())
 
@@ -794,10 +913,12 @@ class FanCurveWidget(QtWidgets.QWidget):
 
         self.points[self.selected] = (t, p)
         self.update()
+        self._notify_points_changed()
 
     def mouseReleaseEvent(self, event):
-        self.selected = None
+        self.dragging = False
         self.update()
+        self._notify_selection_changed()
 
     def interpolate(self, temp):
         pts = sorted(self.points)
@@ -847,6 +968,9 @@ class PumpCurveWidget(QtWidgets.QWidget):
         super().__init__()
         self.points = normalize_pump_curve_points(points)
         self.selected = None
+        self.dragging = False
+        self.selection_changed_callback = None
+        self.points_changed_callback = None
         self._left = 58
         self._top = 18
         self._right = 26
@@ -854,6 +978,14 @@ class PumpCurveWidget(QtWidgets.QWidget):
         self._colors = dict(self.DARK_COLORS)
         self.setMinimumHeight(280)
         self.setMouseTracking(True)
+
+    def _notify_selection_changed(self):
+        if callable(self.selection_changed_callback):
+            self.selection_changed_callback()
+
+    def _notify_points_changed(self):
+        if callable(self.points_changed_callback):
+            self.points_changed_callback()
 
     def set_theme_mode(self, theme_mode):
         self._colors = dict(self.DARK_COLORS if theme_mode == 'dark' else self.LIGHT_COLORS)
@@ -943,15 +1075,22 @@ class PumpCurveWidget(QtWidgets.QWidget):
 
     def mousePressEvent(self, event):
         x, y = event.x(), event.y()
+        self.dragging = False
         for i, (t, value) in enumerate(self.points):
             pos = self._point_to_pos(t, value)
             if abs(pos.x() - x) <= 8 and abs(pos.y() - y) <= 8:
                 self.selected = i
+                self.dragging = True
                 self.update()
+                self._notify_selection_changed()
                 return
+        if self.selected is not None:
+            self.selected = None
+            self.update()
+            self._notify_selection_changed()
 
     def mouseMoveEvent(self, event):
-        if self.selected is None:
+        if self.selected is None or not self.dragging:
             return
         temp, value = self._pos_to_point(event.x(), event.y())
         if self.selected > 0:
@@ -960,10 +1099,12 @@ class PumpCurveWidget(QtWidgets.QWidget):
             temp = min(temp, self.points[self.selected + 1][0] - 1)
         self.points[self.selected] = (temp, value)
         self.update()
+        self._notify_points_changed()
 
     def mouseReleaseEvent(self, event):
-        self.selected = None
+        self.dragging = False
         self.update()
+        self._notify_selection_changed()
 
     def interpolate(self, temp):
         pts = sorted(self.points)
@@ -1035,12 +1176,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_fan_toggle_ts = 0.0
         self._last_pump_toggle_ts = 0.0
         self._resolved_theme_mode = self._get_effective_theme_mode()
+        self.export_api_state = ExportApiState()
+        self.export_api_server = None
         self._build_ui()
         self.sync_ui_from_settings()
+        self._apply_export_api_settings(save=False)
         self.temp_timer = QtCore.QTimer(self)
         self.temp_timer.timeout.connect(self.update_temperatures)
         self.set_update_interval(self.settings.update_interval_sec, save=False)
         self.temp_timer.start()
+        self._refresh_export_api_state()
 
     def _detect_system_theme_mode(self):
         if platform.system() == 'Windows':
@@ -1441,15 +1586,23 @@ class MainWindow(QtWidgets.QMainWindow):
         top_row = QtWidgets.QHBoxLayout()
         top_row.setSpacing(14)
 
-        fan_card, fan_layout = self._create_panel("自动风扇曲线", "拖动控制点定义 CPU 温度与风扇百分比映射；最低可拉到 0% 以实现自动停转。")
+        fan_card, fan_layout = self._create_panel("自动风扇曲线", "拖动控制点定义 CPU 温度与风扇百分比映射；默认 4 个点，支持增加和删除坐标点。")
         self.curve_widget = FanCurveWidget(self.fan_curve_points)
+        self.curve_widget.selection_changed_callback = self._update_curve_editor_buttons
+        self.curve_widget.points_changed_callback = self._on_curve_points_edited
         fan_layout.addWidget(self.curve_widget, 1)
         fan_actions = QtWidgets.QHBoxLayout()
         self.apply_curve_btn = QtWidgets.QPushButton(UI['btn_apply_curve'])
         self.apply_curve_btn.setEnabled(False)
+        self.add_fan_curve_btn = QtWidgets.QPushButton("增加坐标点")
+        self.add_fan_curve_btn.setObjectName("ghostButton")
+        self.remove_fan_curve_btn = QtWidgets.QPushButton("删除选中点")
+        self.remove_fan_curve_btn.setObjectName("ghostButton")
         self.reset_curve_btn = QtWidgets.QPushButton("重置风扇曲线")
         self.reset_curve_btn.setObjectName("ghostButton")
         fan_actions.addWidget(self.apply_curve_btn)
+        fan_actions.addWidget(self.add_fan_curve_btn)
+        fan_actions.addWidget(self.remove_fan_curve_btn)
         fan_actions.addWidget(self.reset_curve_btn)
         fan_actions.addStretch()
         fan_layout.addLayout(fan_actions)
@@ -1459,12 +1612,20 @@ class MainWindow(QtWidgets.QMainWindow):
         fan_card.setMinimumHeight(450)
         top_row.addWidget(fan_card, 3)
 
-        pump_card, pump_layout = self._create_panel("自动水泵曲线", "拖动控制点定义 CPU 温度与水泵电压映射；上限限制为 11V，支持关闭 / 7V / 8V / 11V。")
+        pump_card, pump_layout = self._create_panel("自动水泵曲线", "拖动控制点定义 CPU 温度与水泵电压映射；默认 4 个点，支持增加和删除坐标点。")
         self.pump_curve_widget = PumpCurveWidget(self.pump_curve_points)
+        self.pump_curve_widget.selection_changed_callback = self._update_curve_editor_buttons
+        self.pump_curve_widget.points_changed_callback = self._on_curve_points_edited
         pump_layout.addWidget(self.pump_curve_widget, 1)
         pump_actions = QtWidgets.QHBoxLayout()
+        self.add_pump_curve_btn = QtWidgets.QPushButton("增加坐标点")
+        self.add_pump_curve_btn.setObjectName("ghostButton")
+        self.remove_pump_curve_btn = QtWidgets.QPushButton("删除选中点")
+        self.remove_pump_curve_btn.setObjectName("ghostButton")
         self.reset_pump_curve_btn = QtWidgets.QPushButton("重置水泵曲线")
         self.reset_pump_curve_btn.setObjectName("ghostButton")
+        pump_actions.addWidget(self.add_pump_curve_btn)
+        pump_actions.addWidget(self.remove_pump_curve_btn)
         pump_actions.addWidget(self.reset_pump_curve_btn)
         pump_actions.addStretch()
         pump_layout.addLayout(pump_actions)
@@ -1880,11 +2041,100 @@ class MainWindow(QtWidgets.QMainWindow):
             self.device_tip_label.setText("已选择设备，点击连接即可建立蓝牙连接。")
             if not (self.client and self.client.is_connected):
                 self._set_status_text(UI['select_prompt'], connected=False)
+                self._refresh_export_api_state()
         else:
             self.selected_device_label.setText("设备：等待扫描")
             self.device_tip_label.setText("当前未发现可连接设备")
             if not (self.client and self.client.is_connected):
                 self._set_status_text(UI['searching'], connected=False)
+                self._refresh_export_api_state()
+
+    def _curve_insert_position(self, points, selected_index=None):
+        if len(points) < 2:
+            return None
+        if selected_index is not None:
+            if 0 <= selected_index < len(points) - 1:
+                return selected_index
+            if 1 <= selected_index < len(points):
+                return selected_index - 1
+        largest_gap = None
+        insert_after = None
+        for idx in range(len(points) - 1):
+            gap = int(points[idx + 1][0]) - int(points[idx][0])
+            if gap <= 1:
+                continue
+            if largest_gap is None or gap > largest_gap:
+                largest_gap = gap
+                insert_after = idx
+        return insert_after
+
+    def _insert_curve_point(self, widget, normalizer):
+        points = [tuple(point) for point in widget.points]
+        if len(points) >= MAX_CURVE_POINTS:
+            return False
+        insert_after = self._curve_insert_position(points, widget.selected)
+        if insert_after is None:
+            return False
+        t0, v0 = points[insert_after]
+        t1, v1 = points[insert_after + 1]
+        new_temp = (int(t0) + int(t1)) // 2
+        if new_temp <= int(t0):
+            new_temp = int(t0) + 1
+        if new_temp >= int(t1):
+            new_temp = int(t1) - 1
+        if new_temp <= int(t0) or new_temp >= int(t1):
+            return False
+        new_value = normalizer(round((int(v0) + int(v1)) / 2))
+        points.insert(insert_after + 1, (new_temp, new_value))
+        widget.points = points
+        widget.selected = insert_after + 1
+        widget.update()
+        self._on_curve_points_edited()
+        return True
+
+    def _remove_curve_point(self, widget):
+        points = [tuple(point) for point in widget.points]
+        if len(points) <= MIN_CURVE_POINTS or widget.selected is None:
+            return False
+        del points[widget.selected]
+        widget.points = points
+        widget.selected = min(widget.selected, len(points) - 1) if points else None
+        widget.update()
+        self._on_curve_points_edited()
+        return True
+
+    def add_fan_curve_point(self, checked=False):
+        self._insert_curve_point(self.curve_widget, clamp_curve_percent)
+
+    def remove_fan_curve_point(self, checked=False):
+        self._remove_curve_point(self.curve_widget)
+
+    def add_pump_curve_point(self, checked=False):
+        self._insert_curve_point(self.pump_curve_widget, clamp_pump_curve_value)
+
+    def remove_pump_curve_point(self, checked=False):
+        self._remove_curve_point(self.pump_curve_widget)
+
+    def _update_curve_editor_buttons(self):
+        if hasattr(self, 'add_fan_curve_btn'):
+            self.add_fan_curve_btn.setEnabled(len(self.curve_widget.points) < MAX_CURVE_POINTS)
+        if hasattr(self, 'remove_fan_curve_btn'):
+            self.remove_fan_curve_btn.setEnabled(
+                self.curve_widget.selected is not None and len(self.curve_widget.points) > MIN_CURVE_POINTS
+            )
+        if hasattr(self, 'add_pump_curve_btn'):
+            self.add_pump_curve_btn.setEnabled(len(self.pump_curve_widget.points) < MAX_CURVE_POINTS)
+        if hasattr(self, 'remove_pump_curve_btn'):
+            self.remove_pump_curve_btn.setEnabled(
+                self.pump_curve_widget.selected is not None and len(self.pump_curve_widget.points) > MIN_CURVE_POINTS
+            )
+
+    def _on_curve_points_edited(self):
+        self.apply_curve_btn.setEnabled(True)
+        self._save_curve_settings_from_ui()
+        self._update_control_summaries()
+        self._update_curve_editor_buttons()
+        self.settings.save()
 
     def reset_curve_points(self, checked=False):
         self.reset_fan_curve_points()
@@ -1897,6 +2147,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.curve_widget.update()
         self._save_curve_settings_from_ui()
         self._update_control_summaries()
+        self._update_curve_editor_buttons()
+        self.settings.save()
 
     def reset_pump_curve_points(self, checked=False):
         self.pump_curve_points = [tuple(point) for point in DEFAULT_PUMP_CURVE_POINTS]
@@ -1906,6 +2158,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.pump_curve_widget.update()
         self._save_curve_settings_from_ui()
         self._update_control_summaries()
+        self._update_curve_editor_buttons()
+        self.settings.save()
 
     def _build_ui(self):
         self._apply_styles()
@@ -2045,6 +2299,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.auto_start_checkbox.stateChanged.connect(self.on_auto_start_changed)
         options_layout.addWidget(self.auto_connect_checkbox)
         options_layout.addWidget(self.auto_start_checkbox)
+        self.export_api_enable_checkbox = QtWidgets.QCheckBox("启用 API")
+        options_layout.addWidget(self.export_api_enable_checkbox)
+        self.export_api_port_label = QtWidgets.QLabel("API 端口")
+        options_layout.addWidget(self.export_api_port_label)
+        self.export_api_port_spin = QtWidgets.QSpinBox()
+        self.export_api_port_spin.setRange(1024, 65535)
+        self.export_api_port_spin.setFixedWidth(96)
+        options_layout.addWidget(self.export_api_port_spin)
+        self.export_api_status_label = QtWidgets.QLabel("")
+        self.export_api_status_label.setObjectName("mutedText")
+        options_layout.addWidget(self.export_api_status_label)
         options_layout.addWidget(QtWidgets.QLabel("主题"))
         self.theme_combo = QtWidgets.QComboBox()
         self.theme_combo.addItem("深色", 'dark')
@@ -2063,7 +2328,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.apply_rgb_btn.clicked.connect(self.apply_rgb)
         self.apply_all_btn.clicked.connect(self.apply_all)
         self.apply_curve_btn.clicked.connect(self.apply_curve)
+        self.add_fan_curve_btn.clicked.connect(self.add_fan_curve_point)
+        self.remove_fan_curve_btn.clicked.connect(self.remove_fan_curve_point)
         self.reset_curve_btn.clicked.connect(self.reset_fan_curve_points)
+        self.add_pump_curve_btn.clicked.connect(self.add_pump_curve_point)
+        self.remove_pump_curve_btn.clicked.connect(self.remove_pump_curve_point)
         self.reset_pump_curve_btn.clicked.connect(self.reset_pump_curve_points)
         self.rgb_mode.currentIndexChanged.connect(self.on_rgb_mode_changed)
         self.rgb_color.currentIndexChanged.connect(lambda _: self._update_control_summaries())
@@ -2082,12 +2351,113 @@ class MainWindow(QtWidgets.QMainWindow):
         self.auto_samples_combo.currentIndexChanged.connect(self.on_auto_debounce_settings_changed)
         self.auto_fan_min_toggle_spin.valueChanged.connect(self.on_auto_debounce_settings_changed)
         self.auto_pump_min_toggle_spin.valueChanged.connect(self.on_auto_debounce_settings_changed)
+        self.export_api_enable_checkbox.stateChanged.connect(self.on_export_api_settings_changed)
+        self.export_api_port_spin.valueChanged.connect(self.on_export_api_settings_changed)
         self.theme_combo.currentIndexChanged.connect(self.on_theme_changed)
         self.pages.setCurrentIndex(0)
         self._apply_theme()
         self._update_mode_hint()
         self._sync_rgb_input_states()
         self._update_control_summaries()
+        self._update_curve_editor_buttons()
+
+    def _current_export_fan_percent(self):
+        if self.auto_mode_active and self._auto_applied_fan_percent is not None:
+            return max(0, int(self._auto_applied_fan_percent))
+        if self.settings.fan_is_off:
+            return 0
+        return self._duty_to_fan_slider(self.settings.current_fan_speed)
+
+    def _current_export_pump_voltage(self):
+        if self.pump_runtime_on and self.pump_runtime_voltage is not None:
+            return pump_enum_to_display(self.pump_runtime_voltage)
+        if self.auto_mode_active and self._auto_applied_pump_value is not None:
+            return max(0, int(self._auto_applied_pump_value))
+        if self.settings.pump_is_off:
+            return 0
+        return pump_enum_to_display(self.settings.current_voltage)
+
+    def _apply_export_api_settings(self, save=True):
+        enabled = bool(getattr(self.settings, 'export_api_enabled', False))
+        port = int(getattr(self.settings, 'export_api_port', DEFAULT_EXPORT_API_PORT))
+        if self.export_api_server is not None:
+            same_endpoint = self.export_api_server.host == DEFAULT_EXPORT_API_HOST and self.export_api_server.port == port
+            if (not enabled) or (not same_endpoint):
+                self.export_api_server.stop()
+                self.export_api_server = None
+        if enabled and self.export_api_server is None:
+            self.export_api_server = WatercoolerApiServer(self.export_api_state, DEFAULT_EXPORT_API_HOST, port)
+            self.export_api_server.start()
+            if self.export_api_server._server is None:
+                self.export_api_server = None
+        if save:
+            self.settings.save()
+        self._update_export_api_controls()
+        self._refresh_export_api_state()
+
+    def _update_export_api_controls(self):
+        if not hasattr(self, 'export_api_enable_checkbox'):
+            return
+        enabled = bool(getattr(self.settings, 'export_api_enabled', False))
+        port = int(getattr(self.settings, 'export_api_port', DEFAULT_EXPORT_API_PORT))
+        self.export_api_enable_checkbox.blockSignals(True)
+        self.export_api_port_spin.blockSignals(True)
+        try:
+            if self.export_api_enable_checkbox.isChecked() != enabled:
+                self.export_api_enable_checkbox.setChecked(enabled)
+            self.export_api_port_spin.setEnabled(enabled)
+            self.export_api_port_label.setEnabled(enabled)
+            if self.export_api_port_spin.value() != port:
+                self.export_api_port_spin.setValue(port)
+        finally:
+            self.export_api_enable_checkbox.blockSignals(False)
+            self.export_api_port_spin.blockSignals(False)
+        if hasattr(self, 'export_api_status_label'):
+            if not enabled:
+                self.export_api_status_label.setText('API 已关闭')
+            elif self.export_api_server is None or self.export_api_server._server is None:
+                self.export_api_status_label.setText(f'API 启动失败：127.0.0.1:{port}')
+            else:
+                self.export_api_status_label.setText(f'API：127.0.0.1:{port}')
+
+    def _refresh_export_api_state(self):
+        fan_percent = self._current_export_fan_percent()
+        pump_voltage = self._current_export_pump_voltage()
+        connected = bool(self.client and self.client.is_connected)
+        device_name = None
+        if hasattr(self, 'device_combo') and self.device_combo.count() > 0:
+            device_name = self.device_combo.currentText()
+        control_temp = self._current_control_temperature()
+        api_enabled = bool(getattr(self.settings, 'export_api_enabled', False))
+        api_port = int(getattr(self.settings, 'export_api_port', DEFAULT_EXPORT_API_PORT))
+        api_running = bool(api_enabled and self.export_api_server is not None and self.export_api_server._server is not None)
+        self.export_api_state.update(
+            connected=connected,
+            mode='auto' if self.auto_mode_active else 'manual',
+            device_name=device_name,
+            fan={
+                'percent': fan_percent,
+                'text': f'{fan_percent}%',
+                'is_off': fan_percent <= 0,
+            },
+            pump={
+                'voltage': pump_voltage,
+                'text': pump_curve_value_to_text(pump_voltage),
+                'is_off': pump_voltage <= 0,
+            },
+            temperature={
+                'cpu_c': None if self.last_cpu_temp is None else round(float(self.last_cpu_temp), 1),
+                'gpu_c': None if self.last_gpu_temp is None else round(float(self.last_gpu_temp), 1),
+                'control_c': None if control_temp is None else round(float(control_temp), 1),
+            },
+            api={
+                'enabled': api_enabled,
+                'running': api_running,
+                'host': DEFAULT_EXPORT_API_HOST,
+                'port': api_port,
+                'status_url': f'http://{DEFAULT_EXPORT_API_HOST}:{api_port}/api/status' if api_enabled else None,
+            },
+        )
 
     def _fan_slider_to_duty(self, slider_value):
         slider_value = int(slider_value)
@@ -2120,6 +2490,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.client or not self.client.is_connected:
             self.pump_runtime_on = False
             self.pump_runtime_voltage = None
+            self._refresh_export_api_state()
             return
         if should_run and voltage is not None:
             await write_pump_mode(self.client, voltage)
@@ -2129,6 +2500,7 @@ class MainWindow(QtWidgets.QMainWindow):
             await write_pump_off(self.client)
             self.pump_runtime_on = False
             self.pump_runtime_voltage = None
+        self._refresh_export_api_state()
 
     async def _apply_temperature_rgb_if_needed(self, temp=None, force=False):
         if not hasattr(self, 'rgb_temp_enabled_checkbox') or not self.rgb_temp_enabled_checkbox.isChecked():
@@ -2177,6 +2549,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.auto_mode_enabled = True
         self.settings.selected_mode_index = 1
         self.settings.save()
+        self._refresh_export_api_state()
 
     def sync_ui_from_settings(self):
         self._syncing_ui = True
@@ -2233,6 +2606,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if theme_index >= 0:
                 self.theme_combo.setCurrentIndex(theme_index)
 
+            self.export_api_enable_checkbox.setChecked(bool(self.settings.export_api_enabled))
+            self.export_api_port_spin.setValue(int(self.settings.export_api_port))
+            self._update_export_api_controls()
+
             self.mode_combo.setCurrentIndex(self.settings.selected_mode_index)
             self.auto_mode_active = bool(self.settings.auto_mode_enabled and self.settings.selected_mode_index == 1)
             self._reset_auto_control_state()
@@ -2244,6 +2621,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_rgb_input_states()
         self._update_mode_hint()
         self._update_control_summaries()
+        self._refresh_export_api_state()
 
     async def apply_saved_device_settings(self):
         if not self.client or not self.client.is_connected:
@@ -2307,10 +2685,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._save_curve_settings_from_ui()
         if hasattr(self, 'rgb_temp_enabled_checkbox'):
             self._save_rgb_temp_settings_from_ui()
+        if hasattr(self, 'export_api_enable_checkbox'):
+            self.settings.export_api_enabled = self.export_api_enable_checkbox.isChecked()
+            self.settings.export_api_port = int(self.export_api_port_spin.value())
         self.settings.save()
         if self.client and self.client.is_connected:
             asyncio.ensure_future(write_reset(self.client))
             asyncio.ensure_future(self.client.disconnect())
+        self.export_api_state.update(connected=False, device_name=None)
+        if self.export_api_server:
+            self.export_api_server.stop()
         if self.tray_icon:
             self.tray_icon.hide()
 
@@ -2372,6 +2756,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_auto_start_changed(self, state):
         self.settings.set_autostart(state == QtCore.Qt.Checked)
 
+    def on_export_api_settings_changed(self, *args):
+        if getattr(self, '_syncing_ui', False):
+            return
+        self.settings.export_api_enabled = self.export_api_enable_checkbox.isChecked()
+        self.settings.export_api_port = int(self.export_api_port_spin.value())
+        self._apply_export_api_settings(save=True)
+
     def on_theme_changed(self, index):
         if getattr(self, '_syncing_ui', False):
             return
@@ -2394,6 +2785,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.selected_device_label.setText(f"设备：{self.device_combo.currentText()}")
                 self.device_tip_label.setText("已发现设备，选择后点击连接。")
                 self._set_status_text(UI['select_prompt'], connected=False)
+                self._refresh_export_api_state()
                 if self.settings.auto_connect and not self.client:
                     await self.connect_device(auto_selected=True)
             else:
@@ -2402,6 +2794,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.selected_device_label.setText("设备：未发现")
                 self.device_tip_label.setText("暂未扫描到受支持的水冷设备，程序会自动重试。")
                 self._set_status_text(UI['no_device'], connected=False)
+                self._refresh_export_api_state()
                 QtCore.QTimer.singleShot(5000, lambda: asyncio.ensure_future(self.scan_and_populate()))
         finally:
             self.is_scanning = False
@@ -2430,6 +2823,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 for btn in (self.apply_manual_btn, self.apply_rgb_btn, self.apply_all_btn, self.apply_curve_btn):
                     btn.setEnabled(True)
                 await self.apply_saved_device_settings()
+                self._refresh_export_api_state()
         except Exception:
             self.device_tip_label.setText("连接失败，请重试或重新扫描设备。")
             self._set_status_text(UI['no_device'], connected=False)
@@ -2437,6 +2831,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not self.client or not self.client.is_connected:
                 self.connect_btn.setEnabled(True)
             self.is_connecting = False
+            self._refresh_export_api_state()
 
     @asyncSlot()
     async def update_temperatures(self):
@@ -2460,6 +2855,7 @@ class MainWindow(QtWidgets.QMainWindow):
             await self._apply_auto_runtime('temperature_tick')
         elif self.client and self.client.is_connected and self.rgb_temp_enabled_checkbox.isChecked():
             await self._apply_temperature_rgb_if_needed(self._current_control_temperature())
+        self._refresh_export_api_state()
 
     @asyncSlot()
     async def apply_fan_and_pump(self):
@@ -2494,6 +2890,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.save()
         self.auto_status_label.setText('自动模式未启用')
         self._update_control_summaries()
+        self._refresh_export_api_state()
 
     @asyncSlot()
     async def apply_rgb(self):
@@ -2521,6 +2918,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._last_temp_rgb_bucket = None
         self.settings.save()
         self._update_control_summaries()
+        self._refresh_export_api_state()
 
     @asyncSlot()
     async def apply_all(self):
@@ -2540,6 +2938,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._reset_auto_control_state()
         await self._apply_auto_runtime('manual_enable')
         self._update_control_summaries()
+        self._refresh_export_api_state()
 
 
 def main():

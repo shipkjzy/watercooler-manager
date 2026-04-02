@@ -35,6 +35,12 @@ import ctypes
 import subprocess
 import time
 import threading
+import base64
+import hashlib
+import hmac
+from datetime import datetime
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # === UI STRINGS ===
@@ -423,6 +429,11 @@ class Settings:
         self.auto_pump_min_toggle_interval_sec = DEFAULT_AUTO_PUMP_MIN_TOGGLE_INTERVAL_SEC
         self.export_api_enabled = False
         self.export_api_port = DEFAULT_EXPORT_API_PORT
+        self.last_device_address = None
+        self.last_device_name = None
+        self.dingtalk_webhook_enabled = False
+        self.dingtalk_webhook_url = ''
+        self.dingtalk_webhook_secret = ''
         self.load()
         self.normalize()
         self._sync_autostart_if_needed()
@@ -526,12 +537,19 @@ class Settings:
             self.auto_pump_min_toggle_interval_sec = legacy_interval
         self.auto_pump_min_toggle_interval_sec = max(0.0, min(float(self.auto_pump_min_toggle_interval_sec), 30.0))
 
+        self.last_device_address = str(getattr(self, 'last_device_address', '') or '').strip() or None
+        self.last_device_name = str(getattr(self, 'last_device_name', '') or '').strip() or None
+
         self.export_api_enabled = bool(getattr(self, 'export_api_enabled', False))
         try:
             self.export_api_port = int(getattr(self, 'export_api_port', DEFAULT_EXPORT_API_PORT))
         except Exception:
             self.export_api_port = DEFAULT_EXPORT_API_PORT
         self.export_api_port = max(1024, min(int(self.export_api_port), 65535))
+
+        self.dingtalk_webhook_enabled = bool(getattr(self, 'dingtalk_webhook_enabled', False))
+        self.dingtalk_webhook_url = str(getattr(self, 'dingtalk_webhook_url', '') or '').strip()
+        self.dingtalk_webhook_secret = str(getattr(self, 'dingtalk_webhook_secret', '') or '').strip()
 
     def _load_from_registry(self):
         try:
@@ -630,6 +648,11 @@ class Settings:
                 self.auto_pump_min_toggle_interval_sec = config.get('auto_pump_min_toggle_interval_sec', legacy_min_toggle)
                 self.export_api_enabled = config.get('export_api_enabled', False)
                 self.export_api_port = config.get('export_api_port', DEFAULT_EXPORT_API_PORT)
+                self.last_device_address = config.get('last_device_address')
+                self.last_device_name = config.get('last_device_name')
+                self.dingtalk_webhook_enabled = config.get('dingtalk_webhook_enabled', False)
+                self.dingtalk_webhook_url = config.get('dingtalk_webhook_url', '')
+                self.dingtalk_webhook_secret = config.get('dingtalk_webhook_secret', '')
             return True
         except Exception:
             return False
@@ -664,7 +687,12 @@ class Settings:
                 'auto_fan_min_toggle_interval_sec': self.auto_fan_min_toggle_interval_sec,
                 'auto_pump_min_toggle_interval_sec': self.auto_pump_min_toggle_interval_sec,
                 'export_api_enabled': self.export_api_enabled,
-                'export_api_port': self.export_api_port
+                'export_api_port': self.export_api_port,
+                'last_device_address': self.last_device_address,
+                'last_device_name': self.last_device_name,
+                'dingtalk_webhook_enabled': self.dingtalk_webhook_enabled,
+                'dingtalk_webhook_url': self.dingtalk_webhook_url,
+                'dingtalk_webhook_secret': self.dingtalk_webhook_secret
             }
             config_path = Path(self.CONFIG_FILE)
             config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -818,8 +846,25 @@ class NordicUART:
     CHAR_TX      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'
 
 async def scan_devices(models=("LCT21001", "LCT21002", "LCT22002")):
-    devices = await BleakScanner.discover()
-    return [(d.name, d.address) for d in devices if d.name and any(m in d.name.upper() for m in models)]
+    logging.info('BLE scan start: timeout=6.0, models=%s', ','.join(models))
+    devices = await BleakScanner.discover(timeout=6.0)
+    logging.info('BLE scan raw result count=%d', len(devices))
+    matched = []
+    seen = set()
+    for d in devices:
+        name = (getattr(d, 'name', None) or '').strip()
+        addr = (getattr(d, 'address', None) or '').strip()
+        if not addr or not name:
+            continue
+        if not any(m in name.upper() for m in models):
+            continue
+        key = (name, addr)
+        if key in seen:
+            continue
+        seen.add(key)
+        matched.append((name, addr))
+    logging.info('BLE scan matched count=%d, devices=%s', len(matched), matched[:8])
+    return matched
 
 async def write_fan_mode(client: BleakClient, duty: int):
     safe_duty = clamp_fan_duty(duty)
@@ -1253,6 +1298,8 @@ class PumpCurveWidget(QtWidgets.QWidget):
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    dingtalk_test_result = QtCore.pyqtSignal(bool, str)
+
     UPDATE_INTERVALS = [
         (0.5, "0.5 秒"),
         (1.0, "1 秒"),
@@ -1265,6 +1312,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.dingtalk_test_result.connect(self._on_dingtalk_test_result)
         self.setWindowTitle("水冷管理器")
         self.setMinimumWidth(700)
         self.setAttribute(QtCore.Qt.WA_QuitOnClose, False)
@@ -1307,6 +1355,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.export_api_state = ExportApiState()
         self.export_api_server = None
         self._temperature_update_in_progress = False
+        self._disconnect_callback_scheduled = False
+        self._auto_reconnect_pending = False
         self._build_ui()
         self.sync_ui_from_settings()
         self._apply_export_api_settings(save=False)
@@ -1527,9 +1577,13 @@ class MainWindow(QtWidgets.QMainWindow):
         device_row.setSpacing(10)
         self.device_combo = QtWidgets.QComboBox()
         self.device_combo.setEnabled(False)
+        self.rescan_btn = QtWidgets.QPushButton("重新扫描")
+        self.rescan_btn.setObjectName("ghostButton")
+        self.rescan_btn.setToolTip("立即重新扫描可连接的水冷设备")
         self.connect_btn = QtWidgets.QPushButton(UI['btn_connect'])
         self.connect_btn.setEnabled(False)
         device_row.addWidget(self.device_combo, 1)
+        device_row.addWidget(self.rescan_btn)
         device_row.addWidget(self.connect_btn)
         connect_layout.addLayout(device_row)
         self.device_tip_label = QtWidgets.QLabel("当前未发现可连接设备")
@@ -2467,6 +2521,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.export_api_status_label = QtWidgets.QLabel("")
         self.export_api_status_label.setObjectName("mutedText")
         options_layout.addWidget(self.export_api_status_label)
+        self.dingtalk_enable_checkbox = QtWidgets.QCheckBox("钉钉推送")
+        options_layout.addWidget(self.dingtalk_enable_checkbox)
+        self.dingtalk_settings_btn = QtWidgets.QPushButton("设置")
+        self.dingtalk_settings_btn.setFixedHeight(34)
+        self.dingtalk_settings_btn.setFixedWidth(76)
+        options_layout.addWidget(self.dingtalk_settings_btn)
         options_layout.addWidget(QtWidgets.QLabel("主题"))
         self.theme_combo = QtWidgets.QComboBox()
         self.theme_combo.addItem("深色", 'dark')
@@ -2480,6 +2540,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(main)
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
         self.connect_btn.clicked.connect(self.connect_device)
+        self.rescan_btn.clicked.connect(self.trigger_rescan)
         self.disconnect_btn.clicked.connect(self.disconnect_device)
         self.device_combo.currentIndexChanged.connect(self.on_device_selection_changed)
         self.apply_manual_btn.clicked.connect(self.apply_fan_and_pump)
@@ -2514,9 +2575,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.auto_pump_min_toggle_spin.valueChanged.connect(self.on_auto_debounce_settings_changed)
         self.export_api_enable_checkbox.stateChanged.connect(self.on_export_api_settings_changed)
         self.export_api_port_spin.valueChanged.connect(self.on_export_api_settings_changed)
+        self.dingtalk_enable_checkbox.stateChanged.connect(self.on_dingtalk_enable_changed)
+        self.dingtalk_settings_btn.clicked.connect(self.open_dingtalk_settings_dialog)
         self.theme_combo.currentIndexChanged.connect(self.on_theme_changed)
         self.pages.setCurrentIndex(0)
         self._apply_theme()
+        self._update_dingtalk_controls()
         self._update_mode_hint()
         self._sync_rgb_input_states()
         self._update_control_summaries()
@@ -2601,12 +2665,41 @@ class MainWindow(QtWidgets.QMainWindow):
     async def apply_performance_preset(self):
         await self._apply_manual_preset_values(90, 3)
 
+    def _last_known_device_address(self):
+        value = getattr(self.settings, 'last_device_address', None)
+        value = str(value).strip() if value else ''
+        return value or None
+
+    def _last_known_device_name(self):
+        value = getattr(self.settings, 'last_device_name', None)
+        value = str(value).strip() if value else ''
+        return value or '上次连接设备'
+
+    def _queue_disconnect_handler(self, reason=None):
+        if getattr(self, '_disconnect_callback_scheduled', False) or self._is_exiting:
+            logging.info('BLE disconnect callback ignored: already scheduled=%s, exiting=%s', getattr(self, '_disconnect_callback_scheduled', False), self._is_exiting)
+            return
+        self._disconnect_callback_scheduled = True
+        logging.info('BLE disconnect callback queued: reason=%s', reason or 'unknown')
+
+        async def _run():
+            try:
+                await self._handle_unexpected_disconnect(reason=reason)
+            finally:
+                self._disconnect_callback_scheduled = False
+
+        QtCore.QTimer.singleShot(0, lambda: asyncio.ensure_future(_run()))
+
     def _update_connection_controls(self):
         has_device = bool(hasattr(self, 'device_combo') and self.device_combo.count() > 0 and self.device_combo.currentData())
         connected = bool(self.client and self.client.is_connected)
         busy = bool(self.is_connecting or self.is_disconnecting or self._is_exiting)
+        scanning = bool(getattr(self, 'is_scanning', False))
         if hasattr(self, 'connect_btn'):
-            self.connect_btn.setEnabled((not connected) and has_device and (not busy))
+            self.connect_btn.setEnabled((not connected) and has_device and (not busy) and (not scanning))
+        if hasattr(self, 'rescan_btn'):
+            self.rescan_btn.setEnabled((not busy) and (not scanning))
+            self.rescan_btn.setText("扫描中..." if scanning else "重新扫描")
         if hasattr(self, 'disconnect_btn'):
             self.disconnect_btn.setEnabled(connected and (not busy))
         if not connected:
@@ -2622,6 +2715,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'export_api_enable_checkbox'):
             self.settings.export_api_enabled = self.export_api_enable_checkbox.isChecked()
             self.settings.export_api_port = int(self.export_api_port_spin.value())
+        if hasattr(self, 'dingtalk_enable_checkbox'):
+            self.settings.dingtalk_webhook_enabled = self.dingtalk_enable_checkbox.isChecked()
         self.settings.save()
 
     async def _disconnect_client(self, send_reset: bool = True, update_status: bool = True):
@@ -2658,11 +2753,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._is_exiting = True
         logging.info('Application shutdown requested')
+        if hasattr(self, 'temp_timer') and self.temp_timer.isActive():
+            self.temp_timer.stop()
+            logging.info('Temperature timer stopped for shutdown')
         self._persist_ui_settings()
         self.device_tip_label.setText("正在断开设备并退出…")
         self._set_status_text("正在断开设备并退出...", connected=bool(self.client and self.client.is_connected))
         self._update_connection_controls()
         await self._disconnect_client(send_reset=True, update_status=False)
+        await asyncio.sleep(0.05)
         if self.export_api_server:
             self.export_api_server.stop()
         if self.tray_icon:
@@ -2674,9 +2773,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         logging.warning('BLE device disconnected unexpectedly: %s', reason or 'unknown')
         await self._disconnect_client(send_reset=False, update_status=True)
-        self.device_tip_label.setText("蓝牙连接意外断开，程序已停止自动控制。")
+        self._auto_reconnect_pending = True
+        self._notify_connection_event('unexpected_disconnect')
+        last_addr = self._last_known_device_address()
+        last_name = self._last_known_device_name()
+        if last_addr and self.device_combo.count() == 0:
+            self.device_combo.addItem(f"{last_name} [{last_addr}]（上次连接）", last_addr)
+            self.device_combo.setEnabled(True)
+        self.device_tip_label.setText("蓝牙连接意外断开，程序已停止自动控制；可直接重连上次设备。")
         self._set_status_text("蓝牙连接意外断开", connected=False)
+        self._update_connection_controls()
         if not self.is_scanning:
+            logging.info('Schedule BLE rescan after unexpected disconnect')
             QtCore.QTimer.singleShot(3000, lambda: asyncio.ensure_future(self.scan_and_populate()))
 
     def _is_auto_mode_selected(self):
@@ -3101,17 +3209,282 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.theme_mode = self.theme_combo.currentData()
         self._apply_theme(save=True)
 
+    def on_dingtalk_enable_changed(self, *args):
+        if getattr(self, '_syncing_ui', False):
+            return
+        enabled = bool(self.dingtalk_enable_checkbox.isChecked())
+        if enabled:
+            accepted = self.open_dingtalk_settings_dialog(triggered_by_enable=True)
+            if accepted:
+                self.settings.dingtalk_webhook_enabled = True
+                self.settings.save()
+            else:
+                self.dingtalk_enable_checkbox.blockSignals(True)
+                try:
+                    self.dingtalk_enable_checkbox.setChecked(False)
+                finally:
+                    self.dingtalk_enable_checkbox.blockSignals(False)
+                self.settings.dingtalk_webhook_enabled = False
+                self.settings.save()
+        else:
+            self.settings.dingtalk_webhook_enabled = False
+            self.settings.save()
+        self._update_dingtalk_controls()
+
+    def _update_dingtalk_controls(self):
+        if not hasattr(self, 'dingtalk_enable_checkbox'):
+            return
+        enabled = bool(getattr(self.settings, 'dingtalk_webhook_enabled', False))
+        self.dingtalk_enable_checkbox.blockSignals(True)
+        try:
+            self.dingtalk_enable_checkbox.setChecked(enabled)
+        finally:
+            self.dingtalk_enable_checkbox.blockSignals(False)
+        if hasattr(self, 'dingtalk_settings_btn'):
+            self.dingtalk_settings_btn.setText('设置')
+            self.dingtalk_settings_btn.setToolTip('配置钉钉 Webhook、加签和测试推送')
+
+    def _save_dingtalk_dialog_values(self):
+        if not hasattr(self, '_dingtalk_dialog_webhook_edit'):
+            return False
+        webhook = self._dingtalk_dialog_webhook_edit.text().strip()
+        secret = self._dingtalk_dialog_secret_edit.text().strip()
+        if not webhook:
+            QtWidgets.QMessageBox.warning(self, '钉钉设置', '请先填写 Webhook 地址。')
+            return False
+        self.settings.dingtalk_webhook_url = webhook
+        self.settings.dingtalk_webhook_secret = secret
+        self.settings.save()
+        return True
+
+    def _set_dingtalk_test_status(self, text, success=None):
+        if not hasattr(self, '_dingtalk_dialog_test_status') or self._dingtalk_dialog_test_status is None:
+            return
+        self._dingtalk_dialog_test_status.setText(text)
+        if success is True:
+            self._dingtalk_dialog_test_status.setStyleSheet('color: #169c50;')
+        elif success is False:
+            self._dingtalk_dialog_test_status.setStyleSheet('color: #d43f3a;')
+        else:
+            self._dingtalk_dialog_test_status.setStyleSheet('')
+
+    def _on_dingtalk_dialog_accept(self, dialog):
+        if not self._save_dingtalk_dialog_values():
+            return
+        dialog.accept()
+
+    def _build_dingtalk_settings_dialog(self):
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle('钉钉推送设置')
+        dialog.setModal(True)
+        dialog.resize(620, 240)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        tips_label = QtWidgets.QLabel('填写钉钉机器人 Webhook 与加签密钥。保存后，连接状态变化时会自动推送通知。')
+        tips_label.setWordWrap(True)
+        layout.addWidget(tips_label)
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        form.setFormAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+
+        webhook_edit = QtWidgets.QLineEdit()
+        webhook_edit.setPlaceholderText('https://oapi.dingtalk.com/robot/send?access_token=...')
+        webhook_edit.setText(str(getattr(self.settings, 'dingtalk_webhook_url', '') or ''))
+        form.addRow('Webhook：', webhook_edit)
+
+        secret_edit = QtWidgets.QLineEdit()
+        secret_edit.setPlaceholderText('SEC...，未启用加签可留空')
+        secret_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        secret_edit.setText(str(getattr(self.settings, 'dingtalk_webhook_secret', '') or ''))
+        form.addRow('加签：', secret_edit)
+        layout.addLayout(form)
+
+        status_label = QtWidgets.QLabel('')
+        status_label.setWordWrap(True)
+        layout.addWidget(status_label)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.setSpacing(10)
+        test_btn = QtWidgets.QPushButton('测试推送')
+        save_btn = QtWidgets.QPushButton('保存')
+        cancel_btn = QtWidgets.QPushButton('取消')
+        btn_row.addWidget(test_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        self._dingtalk_settings_dialog = dialog
+        self._dingtalk_dialog_webhook_edit = webhook_edit
+        self._dingtalk_dialog_secret_edit = secret_edit
+        self._dingtalk_dialog_test_btn = test_btn
+        self._dingtalk_dialog_test_status = status_label
+
+        test_btn.clicked.connect(self._test_dingtalk_push_from_dialog)
+        save_btn.clicked.connect(lambda: self._on_dingtalk_dialog_accept(dialog))
+        cancel_btn.clicked.connect(dialog.reject)
+        webhook_edit.returnPressed.connect(lambda: self._on_dingtalk_dialog_accept(dialog))
+        secret_edit.returnPressed.connect(lambda: self._on_dingtalk_dialog_accept(dialog))
+        return dialog
+
+    def open_dingtalk_settings_dialog(self, checked=False, triggered_by_enable=False):
+        dialog = self._build_dingtalk_settings_dialog()
+        self._set_dingtalk_test_status('', success=None)
+        accepted = dialog.exec_() == QtWidgets.QDialog.Accepted
+        self._dingtalk_settings_dialog = None
+        self._dingtalk_dialog_webhook_edit = None
+        self._dingtalk_dialog_secret_edit = None
+        self._dingtalk_dialog_test_btn = None
+        self._dingtalk_dialog_test_status = None
+        if accepted:
+            self._update_dingtalk_controls()
+        return accepted
+
+    def _test_dingtalk_push_from_dialog(self):
+        if not hasattr(self, '_dingtalk_dialog_webhook_edit') or self._dingtalk_dialog_webhook_edit is None:
+            return
+        webhook = self._dingtalk_dialog_webhook_edit.text().strip()
+        secret = self._dingtalk_dialog_secret_edit.text().strip()
+        if not webhook:
+            QtWidgets.QMessageBox.warning(self, '钉钉设置', '请先填写 Webhook 地址。')
+            return
+        webhook_url = self._build_dingtalk_webhook_url_from_values(webhook, secret)
+        if not webhook_url:
+            QtWidgets.QMessageBox.warning(self, '钉钉设置', 'Webhook 地址无效。')
+            return
+        if self._dingtalk_dialog_test_btn is not None:
+            self._dingtalk_dialog_test_btn.setEnabled(False)
+        self._set_dingtalk_test_status('正在发送测试推送...', success=None)
+        message = self._format_dingtalk_message('水冷管理器通知', ['测试推送', f'当前模式：{self._current_mode_text()}'])
+
+        def _worker():
+            success, info = self._send_dingtalk_request(message, webhook_url)
+            self.dingtalk_test_result.emit(success, info)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_dingtalk_test_result(self, success: bool, info: str):
+        if getattr(self, '_dingtalk_dialog_test_btn', None) is not None:
+            self._dingtalk_dialog_test_btn.setEnabled(True)
+        if success:
+            self._set_dingtalk_test_status('测试推送成功。', success=True)
+        else:
+            detail = info or '未知错误'
+            self._set_dingtalk_test_status(f'测试推送失败：{detail}', success=False)
+
+    def _current_mode_text(self):
+        if hasattr(self, 'mode_combo') and self.mode_combo.currentIndex() == 1:
+            return '自动模式'
+        return '手动模式'
+
+    def _build_dingtalk_webhook_url_from_values(self, webhook: str, secret: str = ''):
+        webhook = str(webhook or '').strip()
+        if not webhook:
+            return None
+        secret = str(secret or '').strip()
+        if not secret:
+            return webhook
+        timestamp = str(int(time.time() * 1000))
+        string_to_sign = f"{timestamp}\n{secret}"
+        digest = hmac.new(secret.encode('utf-8'), string_to_sign.encode('utf-8'), digestmod=hashlib.sha256).digest()
+        sign = urllib.parse.quote_plus(base64.b64encode(digest).decode('utf-8'))
+        parsed = urllib.parse.urlsplit(webhook)
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        query = [(k, v) for k, v in query if k not in ('timestamp', 'sign')]
+        query.extend([('timestamp', timestamp), ('sign', sign)])
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(query), parsed.fragment))
+
+    def _build_dingtalk_webhook_url(self):
+        webhook = str(getattr(self.settings, 'dingtalk_webhook_url', '') or '').strip()
+        secret = str(getattr(self.settings, 'dingtalk_webhook_secret', '') or '').strip()
+        return self._build_dingtalk_webhook_url_from_values(webhook, secret)
+
+    def _send_dingtalk_request(self, content: str, webhook_url: str):
+        try:
+            data = json.dumps({'msgtype': 'text', 'text': {'content': content}}, ensure_ascii=False).encode('utf-8')
+            req = urllib.request.Request(webhook_url, data=data, headers={'Content-Type': 'application/json; charset=utf-8'}, method='POST')
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                body = resp.read().decode('utf-8', errors='ignore')
+                status_code = getattr(resp, 'status', 200)
+            logging.info('DingTalk push response: %s', body[:400])
+            if status_code >= 400:
+                return False, f'HTTP {status_code}'
+            try:
+                payload = json.loads(body)
+                if payload.get('errcode') not in (0, '0', None):
+                    return False, payload.get('errmsg') or body[:200]
+            except Exception:
+                pass
+            return True, body[:200]
+        except Exception as exc:
+            logging.exception('DingTalk push failed')
+            return False, str(exc)
+
+    def _send_dingtalk_text(self, content: str):
+        if not bool(getattr(self.settings, 'dingtalk_webhook_enabled', False)):
+            return
+        webhook_url = self._build_dingtalk_webhook_url()
+        if not webhook_url:
+            logging.info('Skip DingTalk push: webhook not configured')
+            return
+
+        def _worker():
+            self._send_dingtalk_request(content, webhook_url)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _format_dingtalk_message(self, title: str, lines):
+        now_text = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        content_lines = [str(title).strip(), f'时间：{now_text}']
+        content_lines.extend([str(line).strip() for line in lines if str(line).strip()])
+        return '\n'.join(content_lines)
+
+    def _notify_connection_event(self, event: str, device_name: str = None):
+        try:
+            device_text = (device_name or self.selected_device_label.text().replace('设备：', '').strip() or self._last_known_device_name())
+            mode_text = self._current_mode_text()
+            if event == 'connected':
+                message = self._format_dingtalk_message('水冷管理器通知', [f'已连接至 {device_text}', f'当前模式：{mode_text}'])
+            elif event == 'auto_reconnected':
+                message = self._format_dingtalk_message('水冷管理器通知', [f'已自动重连至 {device_text}', f'当前模式：{mode_text}'])
+            elif event == 'disconnected':
+                message = self._format_dingtalk_message('水冷管理器通知', ['已断开连接'])
+            elif event == 'unexpected_disconnect':
+                message = self._format_dingtalk_message('水冷管理器通知', [f'意外断开：{device_text}'])
+            else:
+                return
+            self._send_dingtalk_text(message)
+        except Exception:
+            logging.exception('Prepare DingTalk notification failed: event=%s', event)
+
+    def trigger_rescan(self):
+        if self.is_scanning or self.is_connecting or self.is_disconnecting or self._is_exiting:
+            return
+        self.device_tip_label.setText("正在重新扫描设备，请稍候…")
+        self._set_status_text("正在重新扫描设备...", connected=False)
+        self._update_connection_controls()
+        asyncio.ensure_future(self.scan_and_populate())
+
     @asyncSlot()
     async def scan_and_populate(self):
         if self.is_scanning:
+            logging.info('Skip BLE scan: already scanning')
             return
         self.is_scanning = True
+        logging.info('scan_and_populate started')
+        self._update_connection_controls()
         try:
             devices = await scan_devices()
             self.device_combo.clear()
             for n, a in devices:
                 self.device_combo.addItem(f"{n} [{a}]", a)
             if devices:
+                logging.info('scan_and_populate found devices=%s', devices)
                 self.device_combo.setEnabled(True)
                 self.selected_device_label.setText(f"设备：{self.device_combo.currentText()}")
                 self.device_tip_label.setText("已发现设备，选择后点击连接。")
@@ -3121,15 +3494,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self.settings.auto_connect and not self.client:
                     await self.connect_device(auto_selected=True)
             else:
-                self.device_combo.setEnabled(False)
-                self.selected_device_label.setText("设备：未发现")
-                self.device_tip_label.setText("暂未扫描到受支持的水冷设备，程序会自动重试。")
-                self._set_status_text(UI['no_device'], connected=False)
+                logging.info('scan_and_populate found no live BLE device; fallback to last-known if available')
+                last_addr = self._last_known_device_address()
+                last_name = self._last_known_device_name()
+                if last_addr:
+                    self.device_combo.addItem(f"{last_name} [{last_addr}]（上次连接）", last_addr)
+                    self.device_combo.setEnabled(True)
+                    self.selected_device_label.setText(f"设备：{last_name} [{last_addr}]（上次连接）")
+                    self.device_tip_label.setText("本次扫描未发现设备，但可尝试直连上次连接的设备。程序会继续自动重试扫描。")
+                    self._set_status_text("扫描未发现设备，可尝试直连上次设备", connected=False)
+                else:
+                    self.device_combo.setEnabled(False)
+                    self.selected_device_label.setText("设备：未发现")
+                    self.device_tip_label.setText("暂未扫描到受支持的水冷设备，程序会自动重试。")
+                    self._set_status_text(UI['no_device'], connected=False)
                 self._refresh_export_api_state()
                 self._update_connection_controls()
                 QtCore.QTimer.singleShot(5000, lambda: asyncio.ensure_future(self.scan_and_populate()))
         finally:
             self.is_scanning = False
+            logging.info('scan_and_populate finished')
+            self._update_connection_controls()
 
     @asyncSlot()
     async def connect_device(self, auto_selected=False):
@@ -3150,25 +3535,47 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_device_label.setText(f"设备：{self.device_combo.currentText()}")
         self.device_tip_label.setText("正在建立蓝牙连接，请稍候…")
         self._set_status_text(UI['connecting'].format(addr), connected=False)
-        client = BleakClient(addr)
+        def _on_client_disconnected(_client):
+            logging.info('Bleak disconnected callback fired for %s', addr)
+            self._queue_disconnect_handler(reason='bleak_callback')
+
+        client = BleakClient(addr, disconnected_callback=_on_client_disconnected)
         try:
             try:
-                client.set_disconnected_callback(lambda _client: QtCore.QTimer.singleShot(0, lambda: asyncio.ensure_future(self._handle_unexpected_disconnect())))
+                if hasattr(client, 'set_disconnected_callback'):
+                    client.set_disconnected_callback(_on_client_disconnected)
             except Exception:
                 logging.exception('Failed to register BLE disconnected callback')
-            await client.connect(timeout=5.0)
+            await client.connect(timeout=8.0)
             if client.is_connected:
                 self.client = client
+                self.settings.last_device_address = addr
+                self.settings.last_device_name = self.device_combo.currentText()
+                self.settings.save()
                 logging.info('BLE connected: %s', self.device_combo.currentText())
                 self.device_tip_label.setText("设备已连接，可以直接应用设置。")
                 self._set_status_text(UI['connected'].format(self.device_combo.currentText()), connected=True)
                 self._set_manual_action_buttons_enabled(True)
                 await self.apply_saved_device_settings()
+                if auto_selected and self._auto_reconnect_pending:
+                    self._notify_connection_event('auto_reconnected', self.device_combo.currentText())
+                    self._auto_reconnect_pending = False
+                else:
+                    self._notify_connection_event('connected', self.device_combo.currentText())
+                    self._auto_reconnect_pending = False
                 self._refresh_export_api_state()
-        except Exception:
+        except Exception as exc:
+            logging.exception('BLE connect failed: %s', addr)
             self.client = None
-            self.device_tip_label.setText("连接失败，请重试或重新扫描设备。")
-            self._set_status_text(UI['no_device'], connected=False)
+            exc_name = exc.__class__.__name__
+            if exc_name == 'BleakDeviceNotFoundError' or 'not found' in str(exc).lower():
+                self.device_tip_label.setText("直连失败：当前未发现该设备广播，程序将自动重新扫描。")
+                self._set_status_text("设备当前未发现，正在重新扫描", connected=False)
+                if not self.is_scanning:
+                    QtCore.QTimer.singleShot(800, lambda: asyncio.ensure_future(self.scan_and_populate()))
+            else:
+                self.device_tip_label.setText("连接失败，请重试；若扫描不到，也可继续尝试连接上次设备。")
+                self._set_status_text("连接失败", connected=False)
         finally:
             self.is_connecting = False
             self._update_connection_controls()
@@ -3188,6 +3595,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_status_text("正在断开设备...", connected=True)
         try:
             await self._disconnect_client(send_reset=True, update_status=True)
+            self._auto_reconnect_pending = False
+            self._notify_connection_event('disconnected')
         finally:
             self.is_disconnecting = False
             self._update_connection_controls()

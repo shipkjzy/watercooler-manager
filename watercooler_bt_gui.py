@@ -1356,7 +1356,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.export_api_server = None
         self._temperature_update_in_progress = False
         self._disconnect_callback_scheduled = False
+        self._unexpected_disconnect_handling = False
         self._auto_reconnect_pending = False
+        self._suspend_auto_rescan_until_manual = False
+        self._last_notification_key = None
+        self._last_notification_ts = 0.0
         self._build_ui()
         self.sync_ui_from_settings()
         self._apply_export_api_settings(save=False)
@@ -2690,6 +2694,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         QtCore.QTimer.singleShot(0, lambda: asyncio.ensure_future(_run()))
 
+    def _show_unexpected_disconnect_popup(self, device_text=None):
+        try:
+            device_text = str(device_text or self._last_known_device_name() or '水冷设备').strip()
+            message = (
+                f'{device_text} 已意外断开连接。\n\n'
+                '该设备断开后无法自动重连，通常需要先断电重启水冷设备，'
+                '然后点击“重新扫描”并手动重新连接。'
+            )
+            QtWidgets.QMessageBox.warning(self, '水冷设备已断开', message)
+        except Exception:
+            logging.exception('Show unexpected disconnect popup failed')
+
     def _update_connection_controls(self):
         has_device = bool(hasattr(self, 'device_combo') and self.device_combo.count() > 0 and self.device_combo.currentData())
         connected = bool(self.client and self.client.is_connected)
@@ -2771,21 +2787,36 @@ class MainWindow(QtWidgets.QMainWindow):
     async def _handle_unexpected_disconnect(self, reason=None):
         if self._is_exiting or self.is_disconnecting:
             return
-        logging.warning('BLE device disconnected unexpectedly: %s', reason or 'unknown')
-        await self._disconnect_client(send_reset=False, update_status=True)
-        self._auto_reconnect_pending = True
-        self._notify_connection_event('unexpected_disconnect')
-        last_addr = self._last_known_device_address()
-        last_name = self._last_known_device_name()
-        if last_addr and self.device_combo.count() == 0:
-            self.device_combo.addItem(f"{last_name} [{last_addr}]（上次连接）", last_addr)
-            self.device_combo.setEnabled(True)
-        self.device_tip_label.setText("蓝牙连接意外断开，程序已停止自动控制；可直接重连上次设备。")
-        self._set_status_text("蓝牙连接意外断开", connected=False)
-        self._update_connection_controls()
-        if not self.is_scanning:
-            logging.info('Schedule BLE rescan after unexpected disconnect')
-            QtCore.QTimer.singleShot(3000, lambda: asyncio.ensure_future(self.scan_and_populate()))
+        if self._unexpected_disconnect_handling:
+            logging.info('Skip unexpected disconnect handler: already handling, reason=%s', reason or 'unknown')
+            return
+        self._unexpected_disconnect_handling = True
+        try:
+            logging.warning('BLE device disconnected unexpectedly: %s', reason or 'unknown')
+            disconnected_device_text = None
+            try:
+                if hasattr(self, 'device_combo') and self.device_combo.count() > 0:
+                    disconnected_device_text = self.device_combo.currentText()
+            except Exception:
+                disconnected_device_text = None
+            disconnected_device_text = disconnected_device_text or self._last_known_device_name()
+            await self._disconnect_client(send_reset=False, update_status=False)
+            self._auto_reconnect_pending = False
+            self._suspend_auto_rescan_until_manual = True
+            self._notify_connection_event('unexpected_disconnect', disconnected_device_text)
+            last_addr = self._last_known_device_address()
+            last_name = self._last_known_device_name()
+            if last_addr and self.device_combo.count() == 0:
+                self.device_combo.addItem(f"{last_name} [{last_addr}]（上次连接）", last_addr)
+                self.device_combo.setEnabled(True)
+            self.device_tip_label.setText('设备已意外断开，需断电重启水冷设备后，点击“重新扫描”再手动连接。')
+            self._set_status_text('设备意外断开，需断电重启后手动重连', connected=False)
+            self.auto_status_label.setText('自动模式已停止，等待手动重连')
+            self._refresh_export_api_state()
+            self._update_connection_controls()
+            QtCore.QTimer.singleShot(0, lambda: self._show_unexpected_disconnect_popup(disconnected_device_text))
+        finally:
+            self._unexpected_disconnect_handling = False
 
     def _is_auto_mode_selected(self):
         return bool(hasattr(self, 'mode_combo') and self.mode_combo.currentIndex() == 1)
@@ -3404,26 +3435,51 @@ class MainWindow(QtWidgets.QMainWindow):
         secret = str(getattr(self.settings, 'dingtalk_webhook_secret', '') or '').strip()
         return self._build_dingtalk_webhook_url_from_values(webhook, secret)
 
-    def _send_dingtalk_request(self, content: str, webhook_url: str):
+    def _dingtalk_open_request(self, req, timeout=8, direct=False):
+        if direct:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            return opener.open(req, timeout=timeout)
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    def _parse_dingtalk_response(self, resp):
+        body = resp.read().decode('utf-8', errors='ignore')
+        status_code = getattr(resp, 'status', 200)
+        if status_code >= 400:
+            return False, f'HTTP {status_code}'
         try:
-            data = json.dumps({'msgtype': 'text', 'text': {'content': content}}, ensure_ascii=False).encode('utf-8')
-            req = urllib.request.Request(webhook_url, data=data, headers={'Content-Type': 'application/json; charset=utf-8'}, method='POST')
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                body = resp.read().decode('utf-8', errors='ignore')
-                status_code = getattr(resp, 'status', 200)
-            logging.info('DingTalk push response: %s', body[:400])
-            if status_code >= 400:
-                return False, f'HTTP {status_code}'
-            try:
-                payload = json.loads(body)
-                if payload.get('errcode') not in (0, '0', None):
-                    return False, payload.get('errmsg') or body[:200]
-            except Exception:
-                pass
-            return True, body[:200]
-        except Exception as exc:
-            logging.exception('DingTalk push failed')
-            return False, str(exc)
+            payload = json.loads(body)
+            if payload.get('errcode') not in (0, '0', None):
+                return False, payload.get('errmsg') or body[:200]
+        except Exception:
+            pass
+        return True, body[:200]
+
+    def _send_dingtalk_request(self, content: str, webhook_url: str):
+        last_error = None
+        host = urllib.parse.urlsplit(webhook_url).netloc or 'unknown-host'
+        data = json.dumps({'msgtype': 'text', 'text': {'content': content}}, ensure_ascii=False).encode('utf-8')
+        headers = {'Content-Type': 'application/json; charset=utf-8'}
+        for attempt in range(1, 4):
+            for direct in (False, True):
+                transport = 'direct' if direct else 'system'
+                try:
+                    req = urllib.request.Request(webhook_url, data=data, headers=headers, method='POST')
+                    with self._dingtalk_open_request(req, timeout=8, direct=direct) as resp:
+                        ok, info = self._parse_dingtalk_response(resp)
+                    logging.info('DingTalk push response (%s, host=%s): %s', transport, host, str(info)[:400])
+                    if ok:
+                        return True, info
+                    last_error = RuntimeError(str(info))
+                    logging.error('DingTalk push rejected (%s, host=%s, attempt %s/3): %s', transport, host, attempt, info)
+                except Exception as exc:
+                    last_error = exc
+                    logging.exception('DingTalk push failed (attempt %s/3, transport=%s, host=%s)', attempt, transport, host)
+            if attempt < 3:
+                try:
+                    time.sleep(float(attempt))
+                except Exception:
+                    pass
+        return False, str(last_error) if last_error is not None else 'unknown error'
 
     def _send_dingtalk_text(self, content: str):
         if not bool(getattr(self.settings, 'dingtalk_webhook_enabled', False)):
@@ -3448,14 +3504,22 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             device_text = (device_name or self.selected_device_label.text().replace('设备：', '').strip() or self._last_known_device_name())
             mode_text = self._current_mode_text()
+            dedupe_key = (str(event), str(device_text), str(mode_text))
+            now = time.monotonic()
+            if self._last_notification_key == dedupe_key and (now - float(self._last_notification_ts or 0.0)) < 15.0:
+                logging.info('Skip DingTalk push: duplicate notification key=%s', dedupe_key)
+                return
+            self._last_notification_key = dedupe_key
+            self._last_notification_ts = now
             if event == 'connected':
                 message = self._format_dingtalk_message('水冷管理器通知', [f'已连接至 {device_text}', f'当前模式：{mode_text}'])
-            elif event == 'auto_reconnected':
-                message = self._format_dingtalk_message('水冷管理器通知', [f'已自动重连至 {device_text}', f'当前模式：{mode_text}'])
             elif event == 'disconnected':
                 message = self._format_dingtalk_message('水冷管理器通知', ['已断开连接'])
             elif event == 'unexpected_disconnect':
-                message = self._format_dingtalk_message('水冷管理器通知', [f'意外断开：{device_text}'])
+                message = self._format_dingtalk_message('水冷管理器通知', [
+                    f'设备已意外断开：{device_text}',
+                    '该设备无法自动重连，请先断电重启水冷设备，再重新扫描并手动连接。',
+                ])
             else:
                 return
             self._send_dingtalk_text(message)
@@ -3465,6 +3529,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def trigger_rescan(self):
         if self.is_scanning or self.is_connecting or self.is_disconnecting or self._is_exiting:
             return
+        self._suspend_auto_rescan_until_manual = False
         self.device_tip_label.setText("正在重新扫描设备，请稍候…")
         self._set_status_text("正在重新扫描设备...", connected=False)
         self._update_connection_controls()
@@ -3491,7 +3556,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._set_status_text(UI['select_prompt'], connected=False)
                 self._refresh_export_api_state()
                 self._update_connection_controls()
-                if self.settings.auto_connect and not self.client:
+                if self.settings.auto_connect and not self.client and not self._suspend_auto_rescan_until_manual:
                     await self.connect_device(auto_selected=True)
             else:
                 logging.info('scan_and_populate found no live BLE device; fallback to last-known if available')
@@ -3501,16 +3566,25 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.device_combo.addItem(f"{last_name} [{last_addr}]（上次连接）", last_addr)
                     self.device_combo.setEnabled(True)
                     self.selected_device_label.setText(f"设备：{last_name} [{last_addr}]（上次连接）")
-                    self.device_tip_label.setText("本次扫描未发现设备，但可尝试直连上次连接的设备。程序会继续自动重试扫描。")
-                    self._set_status_text("扫描未发现设备，可尝试直连上次设备", connected=False)
+                    if self._suspend_auto_rescan_until_manual:
+                        self.device_tip_label.setText("当前未发现设备。请先断电重启水冷设备，再点击“重新扫描”或手动连接上次设备。")
+                        self._set_status_text("当前未发现设备，请断电重启后手动重连", connected=False)
+                    else:
+                        self.device_tip_label.setText("本次扫描未发现设备，但可尝试直连上次连接的设备。程序会继续自动重试扫描。")
+                        self._set_status_text("扫描未发现设备，可尝试直连上次设备", connected=False)
                 else:
                     self.device_combo.setEnabled(False)
                     self.selected_device_label.setText("设备：未发现")
-                    self.device_tip_label.setText("暂未扫描到受支持的水冷设备，程序会自动重试。")
-                    self._set_status_text(UI['no_device'], connected=False)
+                    if self._suspend_auto_rescan_until_manual:
+                        self.device_tip_label.setText("当前未扫描到受支持的水冷设备。请先断电重启设备，再点击“重新扫描”。")
+                        self._set_status_text("当前未发现设备，请断电重启后手动重连", connected=False)
+                    else:
+                        self.device_tip_label.setText("暂未扫描到受支持的水冷设备，程序会自动重试。")
+                        self._set_status_text(UI['no_device'], connected=False)
                 self._refresh_export_api_state()
                 self._update_connection_controls()
-                QtCore.QTimer.singleShot(5000, lambda: asyncio.ensure_future(self.scan_and_populate()))
+                if not self._suspend_auto_rescan_until_manual:
+                    QtCore.QTimer.singleShot(5000, lambda: asyncio.ensure_future(self.scan_and_populate()))
         finally:
             self.is_scanning = False
             logging.info('scan_and_populate finished')
@@ -3557,24 +3631,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._set_status_text(UI['connected'].format(self.device_combo.currentText()), connected=True)
                 self._set_manual_action_buttons_enabled(True)
                 await self.apply_saved_device_settings()
-                if auto_selected and self._auto_reconnect_pending:
-                    self._notify_connection_event('auto_reconnected', self.device_combo.currentText())
-                    self._auto_reconnect_pending = False
-                else:
-                    self._notify_connection_event('connected', self.device_combo.currentText())
-                    self._auto_reconnect_pending = False
+                self._unexpected_disconnect_handling = False
+                self._auto_reconnect_pending = False
+                self._suspend_auto_rescan_until_manual = False
+                self._notify_connection_event('connected', self.device_combo.currentText())
                 self._refresh_export_api_state()
         except Exception as exc:
             logging.exception('BLE connect failed: %s', addr)
             self.client = None
             exc_name = exc.__class__.__name__
             if exc_name == 'BleakDeviceNotFoundError' or 'not found' in str(exc).lower():
-                self.device_tip_label.setText("直连失败：当前未发现该设备广播，程序将自动重新扫描。")
-                self._set_status_text("设备当前未发现，正在重新扫描", connected=False)
-                if not self.is_scanning:
-                    QtCore.QTimer.singleShot(800, lambda: asyncio.ensure_future(self.scan_and_populate()))
+                self.device_tip_label.setText("直连失败：当前未发现该设备。请先断电重启水冷设备，再点击“重新扫描”。")
+                self._set_status_text("设备当前未发现，请断电重启后手动重连", connected=False)
+                self._suspend_auto_rescan_until_manual = True
             else:
-                self.device_tip_label.setText("连接失败，请重试；若扫描不到，也可继续尝试连接上次设备。")
+                self.device_tip_label.setText("连接失败，请重试；若是异常断开后的重连，请先断电重启水冷设备。")
                 self._set_status_text("连接失败", connected=False)
         finally:
             self.is_connecting = False
@@ -3596,6 +3667,8 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             await self._disconnect_client(send_reset=True, update_status=True)
             self._auto_reconnect_pending = False
+            self._unexpected_disconnect_handling = False
+            self._suspend_auto_rescan_until_manual = False
             self._notify_connection_event('disconnected')
         finally:
             self.is_disconnecting = False

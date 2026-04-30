@@ -82,7 +82,7 @@ DEFAULT_AUTO_DEBOUNCE_SAMPLES = 3
 DEFAULT_AUTO_HYSTERESIS_C = 2.0
 DEFAULT_AUTO_FAN_MIN_TOGGLE_INTERVAL_SEC = 3.0
 DEFAULT_AUTO_PUMP_MIN_TOGGLE_INTERVAL_SEC = 3.0
-DEFAULT_EXPORT_API_HOST = '127.0.0.1'
+DEFAULT_EXPORT_API_HOST = '0.0.0.0'  # 绑定所有网卡，方便 Home Assistant 局域网访问
 DEFAULT_EXPORT_API_PORT = 21977
 MIN_CURVE_POINTS = 2
 MAX_CURVE_POINTS = 8
@@ -188,6 +188,26 @@ def normalize_update_interval(sec):
     except Exception:
         sec = DEFAULT_UPDATE_INTERVAL_SEC
     return max(0.2, min(sec, 60.0))
+
+
+def format_duration_auto(seconds):
+    try:
+        seconds = max(0, int(seconds))
+    except Exception:
+        seconds = 0
+    if seconds < 60:
+        return f"{seconds} 秒"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} 小时"
+    days = hours // 24
+    remain_hours = hours % 24
+    if remain_hours:
+        return f"{days} 天 {remain_hours} 小时"
+    return f"{days} 天"
 
 
 def pump_display_to_enum(value):
@@ -324,8 +344,21 @@ class ExportApiState:
             'mode': 'manual',
             'fan': {'percent': 0, 'text': '0%', 'is_off': True},
             'pump': {'voltage': 0, 'text': '关闭', 'is_off': True},
+            'rgb': {
+                'enabled': False,
+                'text': '未知',
+                'mode': None,
+                'mode_text': '未知',
+                'color': None,
+                'color_text': '未知',
+                'temperature_control': False,
+                'bucket': None,
+                'bucket_text': None,
+            },
             'temperature': {'cpu_c': None, 'gpu_c': None, 'control_c': None},
             'device_name': None,
+            'uptime': {'seconds': 0, 'text': '0 秒'},
+            'connection_uptime': {'seconds': None, 'text': '未连接'},
             'timestamp': int(time.time()),
         }
 
@@ -1330,6 +1363,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
         self.client = None
+        self._app_start_ts = time.time()
+        self._connection_start_ts = None
         self.fan_curve_points = [tuple(point) for point in DEFAULT_FAN_CURVE_POINTS]
         self.pump_curve_points = [tuple(point) for point in DEFAULT_PUMP_CURVE_POINTS]
         self.auto_mode_active = False
@@ -1357,6 +1392,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._temperature_update_in_progress = False
         self._disconnect_callback_scheduled = False
         self._unexpected_disconnect_handling = False
+        self._unexpected_disconnect_popup_open = False
+        self._last_unexpected_disconnect_popup_ts = 0.0
+        self._last_unexpected_disconnect_popup_key = None
         self._auto_reconnect_pending = False
         self._suspend_auto_rescan_until_manual = False
         self._last_notification_key = None
@@ -1536,14 +1574,67 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(header)
         return frame, layout
 
+    def _create_collapsible_panel(self, title, subtitle=None, expanded=False):
+        frame = QtWidgets.QFrame()
+        frame.setObjectName("panelCard")
+        frame.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
+        outer_layout = QtWidgets.QVBoxLayout(frame)
+        outer_layout.setContentsMargins(18, 14, 18, 14)
+        outer_layout.setSpacing(10)
+
+        header_row = QtWidgets.QHBoxLayout()
+        header_row.setSpacing(12)
+
+        title_box = QtWidgets.QVBoxLayout()
+        title_box.setSpacing(3)
+        title_label = QtWidgets.QLabel(title)
+        title_label.setObjectName("sectionTitle")
+        title_box.addWidget(title_label)
+        if subtitle:
+            subtitle_label = QtWidgets.QLabel(subtitle)
+            subtitle_label.setObjectName("sectionSubtitle")
+            subtitle_label.setWordWrap(True)
+            title_box.addWidget(subtitle_label)
+        header_row.addLayout(title_box, 1)
+
+        toggle_btn = QtWidgets.QPushButton()
+        toggle_btn.setObjectName("ghostButton")
+        toggle_btn.setCheckable(True)
+        toggle_btn.setChecked(bool(expanded))
+        toggle_btn.setFixedWidth(76)
+        header_row.addWidget(toggle_btn, 0, QtCore.Qt.AlignTop)
+        outer_layout.addLayout(header_row)
+
+        content_widget = QtWidgets.QWidget()
+        content_widget.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
+        content_layout = QtWidgets.QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 6, 0, 0)
+        content_layout.setSpacing(12)
+        outer_layout.addWidget(content_widget)
+
+        def _sync_collapsed(checked):
+            checked = bool(checked)
+            content_widget.setVisible(checked)
+            content_widget.setMaximumHeight(16777215 if checked else 0)
+            toggle_btn.setText("收起" if checked else "展开")
+            frame.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
+            frame.setMaximumHeight(16777215)
+            frame.adjustSize()
+            frame.updateGeometry()
+            parent = frame.parentWidget()
+            while parent is not None:
+                parent.updateGeometry()
+                parent = parent.parentWidget()
+
+        toggle_btn.toggled.connect(_sync_collapsed)
+        _sync_collapsed(bool(expanded))
+        return frame, content_layout, toggle_btn
+
     def _wrap_page_in_scroll(self, widget):
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        scroll.setWidget(widget)
-        return scroll
+        # 外层主界面已经统一放入 QScrollArea。这里不再给每个模式页单独套滚动区，
+        # 避免出现“只能滚动局部控件，整个界面不能滚动”的问题。
+        widget.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
+        return widget
 
     def _build_slider_scale(self, labels, values=None):
         wrapper = QtWidgets.QVBoxLayout()
@@ -1567,16 +1658,12 @@ class MainWindow(QtWidgets.QMainWindow):
             wrapper.addLayout(values_row)
         return wrapper
 
-    def _build_manual_page(self):
-        manual = QtWidgets.QWidget()
-        page_layout = QtWidgets.QVBoxLayout(manual)
-        page_layout.setContentsMargins(0, 0, 0, 0)
-        page_layout.setSpacing(14)
-
-        top_row = QtWidgets.QHBoxLayout()
-        top_row.setSpacing(14)
-
-        connect_card, connect_layout = self._create_panel("设备连接", "扫描到设备后即可连接；支持启动自动连接。")
+    def _build_connection_panel(self):
+        connect_card, connect_layout, self.connection_fold_btn = self._create_collapsible_panel(
+            "设备连接",
+            "两个模式共用；默认折叠，点击展开后可扫描、选择和连接设备。",
+            expanded=False,
+        )
         device_row = QtWidgets.QHBoxLayout()
         device_row.setSpacing(10)
         self.device_combo = QtWidgets.QComboBox()
@@ -1594,8 +1681,109 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_tip_label.setObjectName("mutedText")
         self.device_tip_label.setWordWrap(True)
         connect_layout.addWidget(self.device_tip_label)
-        connect_card.setMinimumHeight(168)
-        top_row.addWidget(connect_card, 3)
+        return connect_card
+
+    def _build_common_rgb_panel(self):
+        rgb_card, rgb_layout, self.rgb_fold_btn = self._create_collapsible_panel(
+            "RGB 灯效",
+            "两个模式共用；默认折叠，点击展开后可设置灯效和温控 RGB。",
+            expanded=False,
+        )
+        rgb_header = QtWidgets.QHBoxLayout()
+        rgb_header.addWidget(QtWidgets.QLabel(UI['label_rgb']))
+        rgb_header.addStretch()
+        self.rgb_value_pill = QtWidgets.QLabel("静态 · 红色")
+        self.rgb_value_pill.setObjectName("valuePill")
+        rgb_header.addWidget(self.rgb_value_pill)
+        rgb_layout.addLayout(rgb_header)
+
+        rgb_controls = QtWidgets.QGridLayout()
+        rgb_controls.setHorizontalSpacing(10)
+        rgb_controls.setVerticalSpacing(8)
+        self.rgb_mode = NoWheelComboBox()
+        for n, m in RGBMode.__members__.items():
+            display_name = RGB_MODE_NAMES.get(n, n)
+            self.rgb_mode.addItem(display_name, m)
+        self.rgb_color = NoWheelComboBox()
+        for n, c in COLOR_MAP.items():
+            self.rgb_color.addItem(n, c)
+        self.rgb_mode.setMinimumWidth(120)
+        self.rgb_color.setMinimumWidth(90)
+        self.rgb_mode.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.rgb_color.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.apply_rgb_btn = QtWidgets.QPushButton(UI['btn_apply_rgb'])
+        self.apply_rgb_btn.setEnabled(False)
+        self.apply_rgb_btn.setObjectName("ghostButton")
+        self.apply_rgb_btn.setMinimumWidth(96)
+        rgb_controls.addWidget(QtWidgets.QLabel("RGB灯效"), 0, 0)
+        rgb_controls.addWidget(self.rgb_mode, 0, 1)
+        rgb_controls.addWidget(QtWidgets.QLabel("颜色"), 0, 2)
+        rgb_controls.addWidget(self.rgb_color, 0, 3)
+        rgb_controls.addWidget(self.apply_rgb_btn, 0, 4)
+        rgb_controls.setColumnStretch(1, 3)
+        rgb_controls.setColumnStretch(3, 2)
+        rgb_layout.addLayout(rgb_controls)
+
+        temp_enable_row = QtWidgets.QGridLayout()
+        temp_enable_row.setHorizontalSpacing(10)
+        temp_enable_row.setVerticalSpacing(8)
+        self.rgb_temp_enabled_checkbox = QtWidgets.QCheckBox("启用温控 RGB")
+        temp_enable_row.addWidget(self.rgb_temp_enabled_checkbox, 0, 0)
+        temp_enable_row.addWidget(QtWidgets.QLabel("联动模式"), 0, 1)
+        self.rgb_temp_mode_combo = NoWheelComboBox()
+        self.rgb_temp_mode_combo.addItem("静态", RGBMode.STATIC)
+        self.rgb_temp_mode_combo.addItem("呼吸", RGBMode.BREATH)
+        self.rgb_temp_mode_combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        temp_enable_row.addWidget(self.rgb_temp_mode_combo, 0, 2)
+        temp_enable_row.setColumnStretch(2, 1)
+        rgb_layout.addLayout(temp_enable_row)
+
+        temp_grid = QtWidgets.QGridLayout()
+        temp_grid.setHorizontalSpacing(10)
+        temp_grid.setVerticalSpacing(8)
+        temp_grid.addWidget(QtWidgets.QLabel("低温上限"), 0, 0)
+        self.rgb_temp_low_spin = NoWheelSpinBox()
+        self.rgb_temp_low_spin.setRange(20, 95)
+        self.rgb_temp_low_spin.setSuffix(" °C")
+        temp_grid.addWidget(self.rgb_temp_low_spin, 0, 1)
+        temp_grid.addWidget(QtWidgets.QLabel("低温颜色"), 0, 2)
+        self.rgb_temp_low_color = NoWheelComboBox()
+        temp_grid.addWidget(self.rgb_temp_low_color, 0, 3)
+
+        temp_grid.addWidget(QtWidgets.QLabel("中温上限"), 1, 0)
+        self.rgb_temp_high_spin = NoWheelSpinBox()
+        self.rgb_temp_high_spin.setRange(21, 100)
+        self.rgb_temp_high_spin.setSuffix(" °C")
+        temp_grid.addWidget(self.rgb_temp_high_spin, 1, 1)
+        temp_grid.addWidget(QtWidgets.QLabel("中温颜色"), 1, 2)
+        self.rgb_temp_mid_color = NoWheelComboBox()
+        temp_grid.addWidget(self.rgb_temp_mid_color, 1, 3)
+
+        temp_grid.addWidget(QtWidgets.QLabel("高温颜色"), 2, 2)
+        self.rgb_temp_high_color = NoWheelComboBox()
+        temp_grid.addWidget(self.rgb_temp_high_color, 2, 3)
+        for combo in (self.rgb_temp_low_color, self.rgb_temp_mid_color, self.rgb_temp_high_color):
+            combo.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            for n, c in COLOR_MAP.items():
+                combo.addItem(n, c)
+        temp_grid.setColumnStretch(1, 1)
+        temp_grid.setColumnStretch(3, 1)
+        rgb_layout.addLayout(temp_grid)
+
+        self.rgb_help_label = QtWidgets.QLabel("开启温控 RGB 后，会按当前温度自动切换低/中/高三段颜色。")
+        self.rgb_help_label.setObjectName("hintText")
+        self.rgb_help_label.setWordWrap(True)
+        rgb_layout.addWidget(self.rgb_help_label)
+        return rgb_card
+
+    def _build_manual_page(self):
+        manual = QtWidgets.QWidget()
+        page_layout = QtWidgets.QVBoxLayout(manual)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(14)
+
+        top_row = QtWidgets.QHBoxLayout()
+        top_row.setSpacing(14)
 
         quick_card, quick_layout = self._create_panel("快捷操作", "手动模式下可一键切换预设；拖动风扇或水泵后，需点击应用才会真正下发到设备。")
         preset_grid = QtWidgets.QGridLayout()
@@ -1620,9 +1808,6 @@ class MainWindow(QtWidgets.QMainWindow):
         button_grid.setVerticalSpacing(10)
         self.apply_manual_btn = QtWidgets.QPushButton(UI['btn_apply_manual'])
         self.apply_manual_btn.setEnabled(False)
-        self.apply_rgb_btn = QtWidgets.QPushButton(UI['btn_apply_rgb'])
-        self.apply_rgb_btn.setEnabled(False)
-        self.apply_rgb_btn.setObjectName("ghostButton")
         self.apply_all_btn = QtWidgets.QPushButton(UI['btn_apply_all'])
         self.apply_all_btn.setEnabled(False)
         button_grid.addWidget(self.apply_manual_btn, 0, 0)
@@ -1633,131 +1818,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.manual_apply_hint_label.setObjectName("hintText")
         self.manual_apply_hint_label.setWordWrap(True)
         quick_layout.addWidget(self.manual_apply_hint_label)
-        quick_card.setMinimumHeight(230)
+        quick_card.setMinimumHeight(210)
         top_row.addWidget(quick_card, 2)
-        page_layout.addLayout(top_row)
-
-        control_row = QtWidgets.QHBoxLayout()
-        control_row.setSpacing(14)
-
-        left_col = QtWidgets.QVBoxLayout()
-        left_col.setSpacing(14)
-        fan_card, fan_layout = self._create_panel("风扇控制", "手动模式下直接按百分比控制；拖动精度为 1%，最高按上游安全限制钳制到 90%。")
-        fan_header = QtWidgets.QHBoxLayout()
-        fan_header.addWidget(QtWidgets.QLabel(UI['label_fan']))
-        fan_header.addStretch()
-        self.fan_value_pill = QtWidgets.QLabel("50%")
-        self.fan_value_pill.setObjectName("valuePill")
-        fan_header.addWidget(self.fan_value_pill)
-        fan_layout.addLayout(fan_header)
-        self.fan_slider = NoWheelSlider(QtCore.Qt.Horizontal)
-        self.fan_slider.setRange(0, MAX_SAFE_FAN_PERCENT)
-        self.fan_slider.setSingleStep(1)
-        self.fan_slider.setPageStep(5)
-        self.fan_slider.setTickInterval(10)
-        self.fan_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
-        fan_layout.addWidget(self.fan_slider)
-        fan_layout.addLayout(self._build_slider_scale(["0%", "30%", "60%", "90%"]))
-        fan_card.setMinimumHeight(188)
-        left_col.addWidget(fan_card)
-
-        pump_card, pump_layout = self._create_panel("水泵控制", "手动模式下直接设置固定电压；为保护水泵，最高限制为 11V；自动模式下可使用水泵曲线。")
-        pump_header = QtWidgets.QHBoxLayout()
-        pump_header.addWidget(QtWidgets.QLabel(UI['label_pump']))
-        pump_header.addStretch()
-        self.pump_value_pill = QtWidgets.QLabel("7V")
-        self.pump_value_pill.setObjectName("valuePill")
-        pump_header.addWidget(self.pump_value_pill)
-        pump_layout.addLayout(pump_header)
-        self.pump_slider = NoWheelSlider(QtCore.Qt.Horizontal)
-        self.pump_slider.setRange(0, 3)
-        self.pump_slider.setTickInterval(1)
-        self.pump_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
-        pump_layout.addWidget(self.pump_slider)
-        pump_layout.addLayout(self._build_slider_scale(["关闭", "7V", "8V", "11V"]))
-        manual_hint = QtWidgets.QLabel("提示：自动模式会根据温度曲线同时调节风扇与水泵；手动模式不会保留托管控制。")
-        manual_hint.setObjectName("hintText")
-        manual_hint.setWordWrap(True)
-        pump_layout.addWidget(manual_hint)
-        pump_card.setMinimumHeight(188)
-        left_col.addWidget(pump_card)
-        control_row.addLayout(left_col, 3)
-
-        right_col = QtWidgets.QVBoxLayout()
-        right_col.setSpacing(14)
-        rgb_card, rgb_layout = self._create_panel("RGB 灯效", "支持常规灯效，也支持按温度自动切换颜色。")
-        rgb_header = QtWidgets.QHBoxLayout()
-        rgb_header.addWidget(QtWidgets.QLabel(UI['label_rgb']))
-        rgb_header.addStretch()
-        self.rgb_value_pill = QtWidgets.QLabel("静态 · 红色")
-        self.rgb_value_pill.setObjectName("valuePill")
-        rgb_header.addWidget(self.rgb_value_pill)
-        rgb_layout.addLayout(rgb_header)
-        rgb_controls = QtWidgets.QHBoxLayout()
-        rgb_controls.setSpacing(10)
-        self.rgb_mode = NoWheelComboBox()
-        for n, m in RGBMode.__members__.items():
-            display_name = RGB_MODE_NAMES.get(n, n)
-            self.rgb_mode.addItem(display_name, m)
-        self.rgb_color = NoWheelComboBox()
-        for n, c in COLOR_MAP.items():
-            self.rgb_color.addItem(n, c)
-        self.apply_rgb_btn.setMinimumWidth(110)
-        rgb_controls.addWidget(self.rgb_mode, 2)
-        rgb_controls.addWidget(self.rgb_color, 1)
-        rgb_controls.addWidget(self.apply_rgb_btn)
-        rgb_layout.addLayout(rgb_controls)
-
-        self.rgb_temp_enabled_checkbox = QtWidgets.QCheckBox("启用温控 RGB")
-        rgb_layout.addWidget(self.rgb_temp_enabled_checkbox)
-
-        temp_mode_row = QtWidgets.QHBoxLayout()
-        temp_mode_row.setSpacing(10)
-        temp_mode_row.addWidget(QtWidgets.QLabel("联动模式"))
-        self.rgb_temp_mode_combo = NoWheelComboBox()
-        self.rgb_temp_mode_combo.addItem("静态", RGBMode.STATIC)
-        self.rgb_temp_mode_combo.addItem("呼吸", RGBMode.BREATH)
-        temp_mode_row.addWidget(self.rgb_temp_mode_combo, 1)
-        rgb_layout.addLayout(temp_mode_row)
-
-        threshold_row = QtWidgets.QGridLayout()
-        threshold_row.setHorizontalSpacing(10)
-        threshold_row.setVerticalSpacing(8)
-        threshold_row.addWidget(QtWidgets.QLabel("低温上限"), 0, 0)
-        self.rgb_temp_low_spin = NoWheelSpinBox()
-        self.rgb_temp_low_spin.setRange(20, 95)
-        self.rgb_temp_low_spin.setSuffix(" °C")
-        threshold_row.addWidget(self.rgb_temp_low_spin, 0, 1)
-        threshold_row.addWidget(QtWidgets.QLabel("中温上限"), 0, 2)
-        self.rgb_temp_high_spin = NoWheelSpinBox()
-        self.rgb_temp_high_spin.setRange(21, 100)
-        self.rgb_temp_high_spin.setSuffix(" °C")
-        threshold_row.addWidget(self.rgb_temp_high_spin, 0, 3)
-        rgb_layout.addLayout(threshold_row)
-
-        color_grid = QtWidgets.QGridLayout()
-        color_grid.setHorizontalSpacing(10)
-        color_grid.setVerticalSpacing(8)
-        color_grid.addWidget(QtWidgets.QLabel("低温颜色"), 0, 0)
-        self.rgb_temp_low_color = NoWheelComboBox()
-        color_grid.addWidget(self.rgb_temp_low_color, 0, 1)
-        color_grid.addWidget(QtWidgets.QLabel("中温颜色"), 1, 0)
-        self.rgb_temp_mid_color = NoWheelComboBox()
-        color_grid.addWidget(self.rgb_temp_mid_color, 1, 1)
-        color_grid.addWidget(QtWidgets.QLabel("高温颜色"), 2, 0)
-        self.rgb_temp_high_color = NoWheelComboBox()
-        color_grid.addWidget(self.rgb_temp_high_color, 2, 1)
-        for combo in (self.rgb_temp_low_color, self.rgb_temp_mid_color, self.rgb_temp_high_color):
-            for n, c in COLOR_MAP.items():
-                combo.addItem(n, c)
-        rgb_layout.addLayout(color_grid)
-
-        self.rgb_help_label = QtWidgets.QLabel("提示：开启温控 RGB 后，会按当前温度自动切换低/中/高三段颜色。")
-        self.rgb_help_label.setObjectName("hintText")
-        self.rgb_help_label.setWordWrap(True)
-        rgb_layout.addWidget(self.rgb_help_label)
-        rgb_card.setMinimumHeight(360)
-        right_col.addWidget(rgb_card)
 
         overview_card, overview_layout = self._create_panel("当前配置预览", "这里展示将要下发到设备的主要设置，便于快速确认。")
         preview_form = QtWidgets.QFormLayout()
@@ -1778,13 +1840,57 @@ class MainWindow(QtWidgets.QMainWindow):
         preview_form.addRow("水泵设置", self.preview_pump_label)
         preview_form.addRow("RGB 设置", self.preview_rgb_label)
         overview_layout.addLayout(preview_form)
-        overview_card.setMinimumHeight(188)
-        right_col.addWidget(overview_card)
-        right_col.addStretch()
-        control_row.addLayout(right_col, 2)
+        overview_card.setMinimumHeight(210)
+        top_row.addWidget(overview_card, 3)
+        page_layout.addLayout(top_row)
+
+        control_row = QtWidgets.QHBoxLayout()
+        control_row.setSpacing(14)
+
+        fan_card, fan_layout = self._create_panel("风扇控制", "手动模式下直接按百分比控制；拖动精度为 1%，最高按上游安全限制钳制到 90%。")
+        fan_header = QtWidgets.QHBoxLayout()
+        fan_header.addWidget(QtWidgets.QLabel(UI['label_fan']))
+        fan_header.addStretch()
+        self.fan_value_pill = QtWidgets.QLabel("50%")
+        self.fan_value_pill.setObjectName("valuePill")
+        fan_header.addWidget(self.fan_value_pill)
+        fan_layout.addLayout(fan_header)
+        self.fan_slider = NoWheelSlider(QtCore.Qt.Horizontal)
+        self.fan_slider.setRange(0, MAX_SAFE_FAN_PERCENT)
+        self.fan_slider.setSingleStep(1)
+        self.fan_slider.setPageStep(5)
+        self.fan_slider.setTickInterval(10)
+        self.fan_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        fan_layout.addWidget(self.fan_slider)
+        fan_layout.addLayout(self._build_slider_scale(["0%", "30%", "60%", "90%"]))
+        fan_card.setMinimumHeight(190)
+        control_row.addWidget(fan_card, 1)
+
+        pump_card, pump_layout = self._create_panel("水泵控制", "手动模式下直接设置固定电压；为保护水泵，最高限制为 11V；自动模式下可使用水泵曲线。")
+        pump_header = QtWidgets.QHBoxLayout()
+        pump_header.addWidget(QtWidgets.QLabel(UI['label_pump']))
+        pump_header.addStretch()
+        self.pump_value_pill = QtWidgets.QLabel("7V")
+        self.pump_value_pill.setObjectName("valuePill")
+        pump_header.addWidget(self.pump_value_pill)
+        pump_layout.addLayout(pump_header)
+        self.pump_slider = NoWheelSlider(QtCore.Qt.Horizontal)
+        self.pump_slider.setRange(0, 3)
+        self.pump_slider.setTickInterval(1)
+        self.pump_slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        pump_layout.addWidget(self.pump_slider)
+        pump_layout.addLayout(self._build_slider_scale(["关闭", "7V", "8V", "11V"]))
+        manual_hint = QtWidgets.QLabel("提示：自动模式会根据温度曲线同时调节风扇与水泵；手动模式不会保留托管控制。")
+        manual_hint.setObjectName("hintText")
+        manual_hint.setWordWrap(True)
+        pump_layout.addWidget(manual_hint)
+        pump_card.setMinimumHeight(190)
+        control_row.addWidget(pump_card, 1)
 
         page_layout.addLayout(control_row)
+        page_layout.addStretch()
         return manual
+
 
     def _build_auto_page(self):
         auto = QtWidgets.QWidget()
@@ -2374,13 +2480,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_ui(self):
         self._apply_styles()
         self.resize(1060, 820)
-        self.setMinimumSize(920, 700)
+        self.setMinimumSize(760, 560)
         self.setWindowState(self.windowState() | QtCore.Qt.WindowMaximized)
 
         main = QtWidgets.QWidget()
+        main.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
         layout = QtWidgets.QVBoxLayout(main)
         layout.setContentsMargins(22, 20, 22, 20)
-        layout.setSpacing(16)
+        layout.setSpacing(14)
 
         header_card = QtWidgets.QFrame()
         header_card.setObjectName("heroCard")
@@ -2449,11 +2556,20 @@ class MainWindow(QtWidgets.QMainWindow):
         top_bar.addWidget(mode_wrap, 1)
         layout.addLayout(top_bar)
 
+        self.common_controls_grid = QtWidgets.QGridLayout()
+        self.common_controls_grid.setSpacing(14)
+        self.connection_panel = self._build_connection_panel()
+        self.rgb_panel = self._build_common_rgb_panel()
+        layout.addLayout(self.common_controls_grid)
+        self._compact_layout_active = None
+        self._apply_responsive_layout(force=True)
+
         self.pages = QtWidgets.QStackedWidget()
         self.pages.setObjectName("pages")
+        self.pages.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
         self.pages.addWidget(self._wrap_page_in_scroll(self._build_manual_page()))
         self.pages.addWidget(self._wrap_page_in_scroll(self._build_auto_page()))
-        layout.addWidget(self.pages, 1)
+        layout.addWidget(self.pages)
 
         footer_top = QtWidgets.QHBoxLayout()
         footer_top.setSpacing(12)
@@ -2541,7 +2657,13 @@ class MainWindow(QtWidgets.QMainWindow):
         footer_bottom.addWidget(options_card)
         layout.addLayout(footer_bottom)
 
-        self.setCentralWidget(main)
+        self.main_scroll = QtWidgets.QScrollArea()
+        self.main_scroll.setWidgetResizable(True)
+        self.main_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.main_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.main_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.main_scroll.setWidget(main)
+        self.setCentralWidget(self.main_scroll)
         self.mode_combo.currentIndexChanged.connect(self.on_mode_changed)
         self.connect_btn.clicked.connect(self.connect_device)
         self.rescan_btn.clicked.connect(self.trigger_rescan)
@@ -2680,8 +2802,19 @@ class MainWindow(QtWidgets.QMainWindow):
         return value or '上次连接设备'
 
     def _queue_disconnect_handler(self, reason=None):
-        if getattr(self, '_disconnect_callback_scheduled', False) or self._is_exiting:
-            logging.info('BLE disconnect callback ignored: already scheduled=%s, exiting=%s', getattr(self, '_disconnect_callback_scheduled', False), self._is_exiting)
+        if (
+            getattr(self, '_disconnect_callback_scheduled', False)
+            or getattr(self, '_unexpected_disconnect_handling', False)
+            or self._is_exiting
+            or self.is_disconnecting
+        ):
+            logging.info(
+                'BLE disconnect callback ignored: scheduled=%s, handling=%s, disconnecting=%s, exiting=%s',
+                getattr(self, '_disconnect_callback_scheduled', False),
+                getattr(self, '_unexpected_disconnect_handling', False),
+                self.is_disconnecting,
+                self._is_exiting,
+            )
             return
         self._disconnect_callback_scheduled = True
         logging.info('BLE disconnect callback queued: reason=%s', reason or 'unknown')
@@ -2696,7 +2829,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _show_unexpected_disconnect_popup(self, device_text=None):
         try:
+            if getattr(self, '_unexpected_disconnect_popup_open', False):
+                logging.info('Skip unexpected disconnect popup: already open')
+                return
             device_text = str(device_text or self._last_known_device_name() or '水冷设备').strip()
+            popup_key = device_text or 'watercooler'
+            now = time.monotonic()
+            if (
+                self._last_unexpected_disconnect_popup_key == popup_key
+                and (now - float(self._last_unexpected_disconnect_popup_ts or 0.0)) < 20.0
+            ):
+                logging.info('Skip unexpected disconnect popup: duplicate within cooldown')
+                return
+            self._unexpected_disconnect_popup_open = True
+            self._last_unexpected_disconnect_popup_key = popup_key
+            self._last_unexpected_disconnect_popup_ts = now
             message = (
                 f'{device_text} 已意外断开连接。\n\n'
                 '该设备断开后无法自动重连，通常需要先断电重启水冷设备，'
@@ -2705,6 +2852,8 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, '水冷设备已断开', message)
         except Exception:
             logging.exception('Show unexpected disconnect popup failed')
+        finally:
+            self._unexpected_disconnect_popup_open = False
 
     def _update_connection_controls(self):
         has_device = bool(hasattr(self, 'device_combo') and self.device_combo.count() > 0 and self.device_combo.currentData())
@@ -2723,7 +2872,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _persist_ui_settings(self):
         self.settings.selected_mode_index = self.mode_combo.currentIndex() if hasattr(self, 'mode_combo') else 0
-        self.settings.auto_mode_enabled = bool(self.auto_mode_active)
+        self.settings.auto_mode_enabled = bool(self.auto_mode_active or self.settings.selected_mode_index == 1)
         if hasattr(self, 'curve_widget') and hasattr(self, 'pump_curve_widget'):
             self._save_curve_settings_from_ui()
         if hasattr(self, 'rgb_temp_enabled_checkbox'):
@@ -2753,6 +2902,7 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self.pump_runtime_on = False
             self.pump_runtime_voltage = None
+            self._connection_start_ts = None
             self.auto_mode_active = False
             self._last_temp_rgb_bucket = None
             self.export_api_state.update(connected=False, device_name=None)
@@ -2894,9 +3044,81 @@ class MainWindow(QtWidgets.QMainWindow):
             if not enabled:
                 self.export_api_status_label.setText('API 已关闭')
             elif self.export_api_server is None or self.export_api_server._server is None:
-                self.export_api_status_label.setText(f'API 启动失败：127.0.0.1:{port}')
+                self.export_api_status_label.setText(f'API 启动失败：0.0.0.0:{port}')
             else:
-                self.export_api_status_label.setText(f'API：127.0.0.1:{port}')
+                self.export_api_status_label.setText(f'API：0.0.0.0:{port}')
+
+    def _current_rgb_api_info(self):
+        try:
+            temp_control = bool(hasattr(self, 'rgb_temp_enabled_checkbox') and self.rgb_temp_enabled_checkbox.isChecked())
+            if temp_control:
+                payload = self._temperature_rgb_payload(self._current_control_temperature())
+                return {
+                    'enabled': True,
+                    'text': f"温控 / {payload['mode_text']} / {payload['bucket_text']} {payload['color_text']}",
+                    'mode': int(payload['mode']),
+                    'mode_text': payload['mode_text'],
+                    'color': list(payload['color']),
+                    'color_text': payload['color_text'],
+                    'temperature_control': True,
+                    'bucket': payload['bucket'],
+                    'bucket_text': payload['bucket_text'],
+                }
+
+            if hasattr(self, 'rgb_mode'):
+                mode = self.rgb_mode.currentData()
+                mode_text = self.rgb_mode.currentText()
+                if mode == RGBMode.OFF:
+                    return {
+                        'enabled': False,
+                        'text': '关闭',
+                        'mode': int(mode),
+                        'mode_text': mode_text,
+                        'color': None,
+                        'color_text': '无',
+                        'temperature_control': False,
+                        'bucket': None,
+                        'bucket_text': None,
+                    }
+                if mode in [RGBMode.COLORFUL, RGBMode.BREATHE_COLOR]:
+                    return {
+                        'enabled': True,
+                        'text': mode_text,
+                        'mode': int(mode),
+                        'mode_text': mode_text,
+                        'color': None,
+                        'color_text': '动态',
+                        'temperature_control': False,
+                        'bucket': None,
+                        'bucket_text': None,
+                    }
+                color = self._combo_color_value(self.rgb_color, self.settings.rgb_color)
+                color_text = self._color_name_by_value(color)
+                return {
+                    'enabled': True,
+                    'text': f"{mode_text} / {color_text}",
+                    'mode': int(mode),
+                    'mode_text': mode_text,
+                    'color': list(color),
+                    'color_text': color_text,
+                    'temperature_control': False,
+                    'bucket': None,
+                    'bucket_text': None,
+                }
+        except Exception:
+            logging.exception('Build RGB API info failed')
+        return {
+            'enabled': False,
+            'text': '未知',
+            'mode': None,
+            'mode_text': '未知',
+            'color': None,
+            'color_text': '未知',
+            'temperature_control': False,
+            'bucket': None,
+            'bucket_text': None,
+        }
+
 
     def _refresh_export_api_state(self):
         fan_percent = self._current_export_fan_percent()
@@ -2910,6 +3132,10 @@ class MainWindow(QtWidgets.QMainWindow):
         api_port = int(getattr(self.settings, 'export_api_port', DEFAULT_EXPORT_API_PORT))
         api_running = bool(api_enabled and self.export_api_server is not None and self.export_api_server._server is not None)
         auto_selected = self._is_auto_mode_selected()
+        rgb_info = self._current_rgb_api_info()
+        uptime_seconds = int(max(0, time.time() - getattr(self, '_app_start_ts', time.time())))
+        connected_since = getattr(self, '_connection_start_ts', None) if connected else None
+        connection_uptime_seconds = int(max(0, time.time() - connected_since)) if connected_since else None
         self.export_api_state.update(
             connected=connected,
             mode='auto' if auto_selected else 'manual',
@@ -2928,17 +3154,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 'text': pump_curve_value_to_text(pump_voltage),
                 'is_off': pump_voltage <= 0,
             },
+            rgb=rgb_info,
             temperature={
                 'cpu_c': None if self.last_cpu_temp is None else round(float(self.last_cpu_temp), 1),
                 'gpu_c': None if self.last_gpu_temp is None else round(float(self.last_gpu_temp), 1),
                 'control_c': None if control_temp is None else round(float(control_temp), 1),
+            },
+            uptime={
+                'seconds': uptime_seconds,
+                'text': format_duration_auto(uptime_seconds),
+            },
+            connection_uptime={
+                'seconds': connection_uptime_seconds,
+                'text': format_duration_auto(connection_uptime_seconds) if connection_uptime_seconds is not None else '未连接',
             },
             api={
                 'enabled': api_enabled,
                 'running': api_running,
                 'host': DEFAULT_EXPORT_API_HOST,
                 'port': api_port,
-                'status_url': f'http://{DEFAULT_EXPORT_API_HOST}:{api_port}/api/status' if api_enabled else None,
+                'status_url': f'http://127.0.0.1:{api_port}/api/status' if api_enabled else None,
+                'lan_note': 'Home Assistant 请填写运行本程序电脑的局域网 IP',
             },
         )
 
@@ -3113,7 +3349,15 @@ class MainWindow(QtWidgets.QMainWindow):
     async def apply_saved_device_settings(self):
         if not self.client or not self.client.is_connected:
             return
-        if self.settings.selected_mode_index == 1 and self.settings.auto_mode_enabled:
+        selected_auto_mode = (
+            self.settings.selected_mode_index == 1
+            or (hasattr(self, 'mode_combo') and self.mode_combo.currentIndex() == 1)
+        )
+        # 自动连接成功后，按“当前模式”直接恢复运行：当前模式为自动模式时立即启用自动曲线，
+        # 不再依赖上次是否手动点过“启用自动模式”。
+        if selected_auto_mode:
+            self.settings.selected_mode_index = 1
+            self.settings.auto_mode_enabled = True
             self.auto_mode_active = True
             self._reset_auto_control_state()
             await self._apply_auto_runtime('connect')
@@ -3165,6 +3409,38 @@ class MainWindow(QtWidgets.QMainWindow):
     def _cleanup_before_exit(self):
         asyncio.ensure_future(self._shutdown_and_quit())
 
+    def _apply_responsive_layout(self, force=False):
+        if not hasattr(self, 'common_controls_grid'):
+            return
+        compact = self.width() < 1180
+        if not force and getattr(self, '_compact_layout_active', None) == compact:
+            return
+        self._compact_layout_active = compact
+
+        for widget in (getattr(self, 'connection_panel', None), getattr(self, 'rgb_panel', None)):
+            if widget is not None:
+                self.common_controls_grid.removeWidget(widget)
+
+        if compact:
+            self.common_controls_grid.addWidget(self.connection_panel, 0, 0, 1, 1)
+            self.common_controls_grid.addWidget(self.rgb_panel, 1, 0, 1, 1)
+            self.common_controls_grid.setColumnStretch(0, 1)
+            self.common_controls_grid.setColumnStretch(1, 0)
+        else:
+            self.common_controls_grid.addWidget(self.connection_panel, 0, 0, 1, 1, QtCore.Qt.AlignTop)
+            self.common_controls_grid.addWidget(self.rgb_panel, 0, 1, 1, 1, QtCore.Qt.AlignTop)
+            self.common_controls_grid.setColumnStretch(0, 3)
+            self.common_controls_grid.setColumnStretch(1, 2)
+
+        if hasattr(self, 'connection_panel'):
+            self.connection_panel.updateGeometry()
+        if hasattr(self, 'rgb_panel'):
+            self.rgb_panel.updateGeometry()
+
+    def resizeEvent(self, event):
+        self._apply_responsive_layout(force=False)
+        super().resizeEvent(event)
+
     def changeEvent(self, event):
         if event.type() == QtCore.QEvent.WindowStateChange and not self._is_exiting:
             if self.windowState() & QtCore.Qt.WindowMaximized:
@@ -3212,7 +3488,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.settings.auto_mode_enabled = False
             self.auto_status_label.setText('已切回手动模式，自动托管已停止')
         else:
-            self.auto_status_label.setText('自动模式已就绪，等待启用')
+            self.settings.auto_mode_enabled = True
+            if self.client and self.client.is_connected:
+                self.auto_status_label.setText('自动模式已选中，正在启用自动曲线')
+                asyncio.ensure_future(self.apply_curve())
+            else:
+                self.auto_status_label.setText('自动模式已选中，连接成功后会自动启用')
         self._update_mode_hint()
         self._update_control_summaries()
         self._update_manual_apply_hint()
@@ -3613,16 +3894,20 @@ class MainWindow(QtWidgets.QMainWindow):
             logging.info('Bleak disconnected callback fired for %s', addr)
             self._queue_disconnect_handler(reason='bleak_callback')
 
-        client = BleakClient(addr, disconnected_callback=_on_client_disconnected)
         try:
+            client = BleakClient(addr, disconnected_callback=_on_client_disconnected)
+        except TypeError:
+            client = BleakClient(addr)
             try:
                 if hasattr(client, 'set_disconnected_callback'):
                     client.set_disconnected_callback(_on_client_disconnected)
             except Exception:
                 logging.exception('Failed to register BLE disconnected callback')
+        try:
             await client.connect(timeout=8.0)
             if client.is_connected:
                 self.client = client
+                self._connection_start_ts = time.time()
                 self.settings.last_device_address = addr
                 self.settings.last_device_name = self.device_combo.currentText()
                 self.settings.save()
